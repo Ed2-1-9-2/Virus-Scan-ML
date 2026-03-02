@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 import webbrowser
+import shutil
 from pathlib import Path
 
 REPO_URL = "https://github.com/Ed2-1-9-2/Virus-Scan-ML.git"
@@ -56,12 +57,28 @@ def run_command(args: list[str], cwd: Path | None = None, timeout: int = 180) ->
         return 1, str(exc)
 
 
+def has_local_fullstack_layout(root: Path) -> bool:
+    """Return True if root looks like unpacked app bundle."""
+    return (root / "m-virus").exists() and (root / "m-virus-ui").exists()
+
+
 def resolve_repo_root(base: Path) -> Path:
     """Resolve or clone local repository folder."""
+    if has_local_fullstack_layout(base):
+        return base
+
+    for candidate_name in ("Virus-Scan-ML-main", "Virus-Scan-ML", REPO_DIR_NAME):
+        candidate = base / candidate_name
+        if has_local_fullstack_layout(candidate):
+            return candidate
+
     if (base / ".git").exists():
         return base
 
     nested = base / REPO_DIR_NAME
+    if has_local_fullstack_layout(nested):
+        return nested
+
     if (nested / ".git").exists():
         return nested
 
@@ -77,6 +94,10 @@ def resolve_repo_root(base: Path) -> Path:
 
 def update_repo(repo_root: Path) -> None:
     """Fetch and pull latest code from GitHub."""
+    if not (repo_root / ".git").exists():
+        # Local ZIP/extracted bundle mode: skip git update and continue.
+        return
+
     code, output = run_command(["git", "-C", str(repo_root), "fetch", "origin", REPO_BRANCH], timeout=120)
     if code != 0:
         raise RuntimeError(f"git fetch failed:\n{output}")
@@ -112,6 +133,8 @@ def ensure_backend_python(backend_dir: Path) -> Path:
 
     code, output = run_command(["py", "-3.10", "-m", "venv", ".venv"], cwd=backend_dir, timeout=300)
     if code != 0:
+        code, output = run_command([sys.executable, "-m", "venv", ".venv"], cwd=backend_dir, timeout=300)
+    if code != 0:
         raise RuntimeError(f"Could not create backend virtualenv:\n{output}")
 
     backend_python = backend_dir / ".venv" / "Scripts" / "python.exe"
@@ -127,10 +150,17 @@ def ensure_backend_python(backend_dir: Path) -> Path:
 
 def ensure_frontend_dependencies(frontend_dir: Path) -> None:
     """Install frontend dependencies if node_modules is missing."""
+    npm_path = shutil.which("npm.cmd") or shutil.which("npm")
+    if not npm_path:
+        raise RuntimeError(
+            "Node.js/NPM was not found in PATH.\n"
+            "Install Node.js LTS from https://nodejs.org and reopen the launcher."
+        )
+
     if (frontend_dir / "node_modules").exists():
         return
 
-    code, output = run_command(["npm", "install"], cwd=frontend_dir, timeout=900)
+    code, output = run_command([npm_path, "install"], cwd=frontend_dir, timeout=900)
     if code != 0:
         raise RuntimeError(f"Could not install frontend dependencies:\n{output}")
 
@@ -169,13 +199,22 @@ def main() -> int:
         message_box(str(exc), title="Launcher dependency error")
         return 1
 
+    npm_path = shutil.which("npm.cmd") or shutil.which("npm")
+    if not npm_path:
+        message_box(
+            "Node.js/NPM was not found in PATH.\n"
+            "Install Node.js LTS from https://nodejs.org and reopen the launcher.",
+            title="Launcher dependency error",
+        )
+        return 1
+
     backend_cmd = (
         f'Set-Location "{backend_dir}"; '
         f'& "{backend_python}" -m backend.api_backend'
     )
     frontend_cmd = (
         f'Set-Location "{frontend_dir}"; '
-        "npm start"
+        f'& "{npm_path}" start'
     )
 
     try:

@@ -40,7 +40,6 @@ if [ -d "$FRONTEND_DIR" ]; then
 fi
 
 sleep 4
-start "" "http://localhost:3000"
 
 #  Pornim Backend-ul din ascunzătoarea lui
 echo "Pornesc serverul FastAPI..."

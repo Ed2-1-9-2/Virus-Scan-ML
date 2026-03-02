@@ -1,0 +1,115 @@
+{
+  "model_type": "XGBoost Binary Classifier",
+  "created_at": "2026-02-26T18:42:04.466486",
+  "threshold": 0.5,
+  "input_features": 3008,
+  "training_samples": 100000,
+  "test_samples": 10000,
+  "metrics": {
+    "accuracy": 0.9351,
+    "precision": 0.9523809523809523,
+    "recall": 0.916,
+    "f1_score": 0.933836272810684,
+    "roc_auc": 0.9817106800000001,
+    "threshold": 0.5
+  },
+  "confusion_matrix": [
+    [
+      4771,
+      229
+    ],
+    [
+      420,
+      4580
+    ]
+  ],
+  "roc_curve_points": [
+    [
+      0.0,
+      0.0
+    ],
+    [
+      0.01,
+      0.36
+    ],
+    [
+      0.03,
+      0.61
+    ],
+    [
+      0.06,
+      0.75
+    ],
+    [
+      0.1,
+      0.84
+    ],
+    [
+      0.18,
+      0.91
+    ],
+    [
+      0.3,
+      0.95
+    ],
+    [
+      1.0,
+      1.0
+    ]
+  ],
+  "correlation_labels": [
+    "Byte entropy",
+    "PE headers",
+    "Import graph",
+    "Section stats",
+    "String signals"
+  ],
+  "correlation_matrix": [
+    [
+      1.0,
+      0.72,
+      -0.18,
+      0.54,
+      0.33
+    ],
+    [
+      0.72,
+      1.0,
+      -0.12,
+      0.47,
+      0.28
+    ],
+    [
+      -0.18,
+      -0.12,
+      1.0,
+      -0.41,
+      -0.22
+    ],
+    [
+      0.54,
+      0.47,
+      -0.41,
+      1.0,
+      0.36
+    ],
+    [
+      0.33,
+      0.28,
+      -0.22,
+      0.36,
+      1.0
+    ]
+  ],
+  "notes": "Trained on EMBER + BODMAS using separate feature blocks (EMBER=626, BODMAS=2381, +domain_flag). Inference from EMBER/PE inputs naturally fills EMBER block while BODMAS block remains zero.",
+  "training_info": {
+    "feature_space_mode": "separate_blocks",
+    "ember_features": 626,
+    "bodmas_features": 2381,
+    "domain_flag_index": 3007,
+    "ember_train_samples": 50000,
+    "bodmas_train_samples": 50000,
+    "test_split": "EMBER test"
+  },
+  "bodmas_included": true
+}

@@ -1,0 +1,14 @@
+﻿# Optional dependencies for PE file feature extraction
+# Needed only for /predict-file, /scan-archive, and predict_pe_file.py utility.
+#
+# EMBER source + parser dependencies:
+# - ember provides PEFeatureExtractor implementation
+# - lief is required by ember/features.py for PE parsing
+# - rarfile enables .rar archive scan support (requires unrar/bsdtar in system)
+# - py7zr enables .7z archive scan support
+#
+# Note: if Python 3.14 fails, use Python 3.10/3.11 virtualenv.
+git+https://github.com/elastic/ember.git
+lief
+rarfile
+py7zr

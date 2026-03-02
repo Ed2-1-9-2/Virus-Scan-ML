@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  malware-api:
+    build: .
+    container_name: xgboost-malware-detector-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MODEL_PATH=/app/models/xgboost_malware_model.json
+      - MODEL_METADATA_PATH=/app/models/model_metadata.json
+    networks:
+      - malware-network
+
+  malware-frontend:
+    image: node:18-alpine
+    container_name: xgboost-malware-detector-ui
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./react-app:/app
+    working_dir: /app
+    command: npm start
+    profiles:
+      - frontend
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+    networks:
+      - malware-network
+    depends_on:
+      - malware-api
+
+networks:
+  malware-network:
+    driver: bridge

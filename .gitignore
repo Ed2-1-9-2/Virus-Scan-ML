@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Node / React
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build artifacts
+build/
+dist/
+*.spec
+_build_Start_MVirus_App/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local env / secrets
+.env
+.env.local
+.env.*.local
+.env.smtp
+.env.smtp.local
+
+# Runtime logs and generated reports
+reports/contact_messages.txt
+*.log
+
+# Large datasets excluded from repo snapshot
+m-virus/bodmas/
+m-virus/ember_dataset/
+m-virus/ember_dataset_2017_2/
+m-virus/ember_dataset_2018_2/
+m-virus/reports/
+m-virus/.venv/
+m-virus-ui/node_modules/
+m-virus-ui/build/

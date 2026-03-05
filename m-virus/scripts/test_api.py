@@ -183,8 +183,59 @@ class APITester:
             self.print_test("Scan Archive Endpoint", "FAIL", f"Error: {exc}")
             return False
 
+    def test_predict_url_endpoint(self) -> bool:
+        self.print_section("TEST 5: Predict URL Endpoint")
+
+        try:
+            info = self.session.get(f"{self.base_url}/model-info", timeout=10).json()
+            enabled = bool(info.get("predict_url_enabled", False))
+
+            payload = {"url": "https://secure-login-example.com/account/verify?token=abc123"}
+            response = self.session.post(f"{self.base_url}/predict-url", json=payload, timeout=20)
+
+            if enabled:
+                if response.status_code != 200:
+                    self.print_test(
+                        "Predict URL Endpoint",
+                        "FAIL",
+                        f"Expected 200 with URL model enabled, got {response.status_code}",
+                    )
+                    return False
+
+                data = response.json()
+                required = {"prediction", "probability_phishing", "confidence", "normalized_url"}
+                missing = required - set(data.keys())
+                if missing:
+                    self.print_test("Predict URL Endpoint", "FAIL", f"Missing fields: {sorted(missing)}")
+                    return False
+
+                self.print_test(
+                    "Predict URL Endpoint",
+                    "PASS",
+                    f"prediction={data.get('prediction')} probability={data.get('probability_phishing'):.4f}",
+                )
+                return True
+
+            if response.status_code == 503:
+                self.print_test(
+                    "Predict URL Endpoint",
+                    "PASS",
+                    "Endpoint reachable; URL model not loaded (expected 503).",
+                )
+                return True
+
+            self.print_test(
+                "Predict URL Endpoint",
+                "FAIL",
+                f"Unexpected status {response.status_code} when URL model disabled",
+            )
+            return False
+        except Exception as exc:
+            self.print_test("Predict URL Endpoint", "FAIL", f"Error: {exc}")
+            return False
+
     def test_irrelevant_routes_removed(self) -> bool:
-        self.print_section("TEST 5: Removed Routes")
+        self.print_section("TEST 6: Removed Routes")
 
         removed = ["/predict", "/predict-batch", "/scan-jsonl", "/scan-results/test", "/stats"]
         all_ok = True
@@ -206,7 +257,7 @@ class APITester:
         return all_ok
 
     def test_cors_and_response_times(self) -> bool:
-        self.print_section("TEST 6: CORS + Response Times")
+        self.print_section("TEST 7: CORS + Response Times")
 
         try:
             options_response = self.session.options(
@@ -266,6 +317,7 @@ class APITester:
         self.test_model_info()
         self.test_predict_file_endpoint()
         self.test_scan_archive_endpoint()
+        self.test_predict_url_endpoint()
         self.test_irrelevant_routes_removed()
         self.test_cors_and_response_times()
 

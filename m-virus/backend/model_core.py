@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
+from urllib.parse import urlparse
 
 import numpy as np
 import xgboost as xgb
@@ -92,6 +94,49 @@ def load_metadata(metadata_path: Path) -> Dict[str, Any]:
         return {}
 
 
+def _resolve_threshold(
+    metadata: Dict[str, Any],
+    threshold: Optional[float] = None,
+    default: float = 0.5,
+) -> float:
+    meta_threshold = metadata.get("threshold")
+    if threshold is not None:
+        return float(threshold)
+    if isinstance(meta_threshold, (int, float)):
+        return float(meta_threshold)
+    return float(default)
+
+
+def _build_binary_prediction(proba: float, threshold: float, sha256: Optional[str]) -> Dict[str, Any]:
+    prediction = "Malware" if proba >= threshold else "Benign"
+    return {
+        "prediction": prediction,
+        "probability_malware": proba,
+        "confidence": float(max(proba, 1.0 - proba)),
+        "sha256": sha256,
+    }
+
+
+def normalize_url_text(url: str) -> str:
+    value = (url or "").strip()
+    if not value:
+        raise ValueError("URL is empty")
+
+    if "://" not in value:
+        value = f"http://{value}"
+
+    parsed = urlparse(value)
+    if not parsed.netloc:
+        raise ValueError("URL is invalid")
+
+    scheme = (parsed.scheme or "http").lower()
+    netloc = parsed.netloc.lower()
+    path = parsed.path or "/"
+    query = f"?{parsed.query}" if parsed.query else ""
+    fragment = f"#{parsed.fragment}" if parsed.fragment else ""
+    return f"{scheme}://{netloc}{path}{query}{fragment}"
+
+
 class XGBoostMalwareModel:
     """Runtime wrapper around an XGBoost malware classifier."""
 
@@ -113,25 +158,12 @@ class XGBoostMalwareModel:
         self.metadata = load_metadata(self.metadata_path)
         self.feature_count = int(self.model.num_features())
 
-        meta_threshold = self.metadata.get("threshold")
-        if threshold is not None:
-            self.threshold = float(threshold)
-        elif isinstance(meta_threshold, (int, float)):
-            self.threshold = float(meta_threshold)
-        else:
-            self.threshold = 0.5
+        self.threshold = _resolve_threshold(self.metadata, threshold=threshold, default=0.5)
 
     def predict_one(self, features: Sequence[float], sha256: Optional[str] = None) -> Dict[str, Any]:
         arr = normalize_features(features, self.feature_count).reshape(1, -1)
         proba = float(self.model.predict(xgb.DMatrix(arr))[0])
-        prediction = "Malware" if proba >= self.threshold else "Benign"
-
-        return {
-            "prediction": prediction,
-            "probability_malware": proba,
-            "confidence": float(max(proba, 1.0 - proba)),
-            "sha256": sha256,
-        }
+        return _build_binary_prediction(proba=proba, threshold=self.threshold, sha256=sha256)
 
     def predict_batch(self, embeddings: Sequence[Sequence[float]]) -> Dict[str, np.ndarray]:
         matrix = np.asarray(embeddings, dtype=np.float32)
@@ -183,13 +215,183 @@ class XGBoostMalwareModel:
         return results
 
 
+class LightGBMMalwareModel:
+    """Runtime wrapper around a LightGBM malware classifier."""
+
+    def __init__(
+        self,
+        model_path: Path | str,
+        metadata_path: Path | str,
+        threshold: Optional[float] = None,
+    ) -> None:
+        self.model_path = Path(model_path)
+        self.metadata_path = Path(metadata_path)
+
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"Model file not found: {self.model_path}")
+
+        try:
+            import lightgbm as lgb  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "LightGBM runtime dependency is missing. Install it with: pip install lightgbm"
+            ) from exc
+
+        self.model = lgb.Booster(model_file=str(self.model_path))
+        self.metadata = load_metadata(self.metadata_path)
+
+        meta_input = self.metadata.get("input_features")
+        if isinstance(meta_input, int) and meta_input > 0:
+            self.feature_count = int(meta_input)
+        else:
+            self.feature_count = int(self.model.num_feature())
+
+        self.threshold = _resolve_threshold(self.metadata, threshold=threshold, default=0.5)
+
+    def predict_one(self, features: Sequence[float], sha256: Optional[str] = None) -> Dict[str, Any]:
+        arr = normalize_features(features, self.feature_count).reshape(1, -1)
+        proba = float(self.model.predict(arr)[0])
+        return _build_binary_prediction(proba=proba, threshold=self.threshold, sha256=sha256)
+
+
+class RandomForestMalwareModel:
+    """Runtime wrapper around a scikit-learn RandomForest malware classifier."""
+
+    def __init__(
+        self,
+        model_path: Path | str,
+        metadata_path: Path | str,
+        threshold: Optional[float] = None,
+    ) -> None:
+        self.model_path = Path(model_path)
+        self.metadata_path = Path(metadata_path)
+
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"Model file not found: {self.model_path}")
+
+        try:
+            from joblib import load as joblib_load  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "RandomForest runtime dependency is missing. Install it with: pip install joblib scikit-learn"
+            ) from exc
+
+        self.model = joblib_load(self.model_path)
+        self.metadata = load_metadata(self.metadata_path)
+
+        meta_input = self.metadata.get("input_features")
+        if isinstance(meta_input, int) and meta_input > 0:
+            self.feature_count = int(meta_input)
+        else:
+            self.feature_count = int(getattr(self.model, "n_features_in_", 0))
+        if self.feature_count <= 0:
+            raise RuntimeError(
+                "Could not determine RandomForest input feature count from model/metadata."
+            )
+
+        if not hasattr(self.model, "predict_proba"):
+            raise RuntimeError("RandomForest model does not expose predict_proba().")
+
+        self.threshold = _resolve_threshold(self.metadata, threshold=threshold, default=0.5)
+
+    def predict_one(self, features: Sequence[float], sha256: Optional[str] = None) -> Dict[str, Any]:
+        arr = normalize_features(features, self.feature_count).reshape(1, -1)
+        probas = self.model.predict_proba(arr)
+        if probas.ndim != 2 or probas.shape[1] < 2:
+            raise RuntimeError("RandomForest predict_proba output has unexpected shape.")
+        proba = float(probas[0, 1])
+        return _build_binary_prediction(proba=proba, threshold=self.threshold, sha256=sha256)
+
+
+class URLPhishingModel:
+    """Runtime wrapper for URL phishing classification model."""
+
+    def __init__(
+        self,
+        model_path: Path | str,
+        metadata_path: Optional[Path | str] = None,
+        threshold: Optional[float] = None,
+    ) -> None:
+        self.model_path = Path(model_path)
+        if metadata_path is not None:
+            self.metadata_path = Path(metadata_path)
+        else:
+            self.metadata_path = self.model_path.with_name(f"{self.model_path.stem}_metadata.json")
+
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"URL model file not found: {self.model_path}")
+
+        try:
+            from joblib import load as joblib_load  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "URL model runtime dependency missing. Install with: pip install joblib scikit-learn"
+            ) from exc
+
+        artifact = joblib_load(self.model_path)
+        if not isinstance(artifact, dict):
+            raise RuntimeError("Invalid URL phishing model artifact format (expected dict).")
+        if "vectorizer" not in artifact or "classifier" not in artifact:
+            raise RuntimeError("Invalid URL phishing model artifact keys (expected vectorizer/classifier).")
+
+        self.vectorizer = artifact["vectorizer"]
+        self.classifier = artifact["classifier"]
+        self.model_type = str(artifact.get("model_type", "URL Phishing Classifier"))
+        self.created_at = artifact.get("created_at")
+
+        self.metadata = load_metadata(self.metadata_path)
+        self.threshold = _resolve_threshold(self.metadata, threshold=threshold, default=0.5)
+
+        vector_features = getattr(self.vectorizer, "n_features", None)
+        meta_features = self.metadata.get("input_features")
+        if isinstance(meta_features, int) and meta_features > 0:
+            self.feature_count = int(meta_features)
+        elif isinstance(vector_features, int) and vector_features > 0:
+            self.feature_count = int(vector_features)
+        else:
+            self.feature_count = 0
+
+    def predict_one(self, url: str) -> Dict[str, Any]:
+        normalized_url = normalize_url_text(url)
+        matrix = self.vectorizer.transform([normalized_url])
+
+        if hasattr(self.classifier, "predict_proba"):
+            probas = self.classifier.predict_proba(matrix)
+            if probas.ndim != 2 or probas.shape[1] < 2:
+                raise RuntimeError("URL model predict_proba output has unexpected shape.")
+            proba = float(probas[0, 1])
+        elif hasattr(self.classifier, "decision_function"):
+            score = float(self.classifier.decision_function(matrix)[0])
+            proba = float(1.0 / (1.0 + np.exp(-score)))
+        else:
+            raise RuntimeError("URL model does not support probability inference.")
+
+        prediction = "Phishing" if proba >= self.threshold else "Legitimate"
+        confidence = float(max(proba, 1.0 - proba))
+
+        return {
+            "url": url,
+            "normalized_url": normalized_url,
+            "prediction": prediction,
+            "probability_phishing": proba,
+            "confidence": confidence,
+            "threshold": float(self.threshold),
+            "model_type": self.model_type,
+            "created_at": self.metadata.get("created_at", self.created_at or datetime.now().isoformat()),
+        }
+
+
 __all__ = [
     "DEFAULT_METADATA_PATH",
     "DEFAULT_MODEL_PATH",
     "EMBER_CATEGORIES",
+    "LightGBMMalwareModel",
+    "RandomForestMalwareModel",
+    "URLPhishingModel",
     "XGBoostMalwareModel",
     "flatten_ember_features",
     "iter_jsonl_records",
     "load_metadata",
+    "normalize_url_text",
     "normalize_features",
 ]

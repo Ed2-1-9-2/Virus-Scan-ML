@@ -52,3 +52,7 @@ m-virus/.venv/
 m-virus-ui/node_modules/
 m-virus-ui/build/
 m-virus/models/random_forest_malware_model.joblib
+<<<<<<< Updated upstream
+=======
+m-virus/models/random_forest_malware_model.joblib
+>>>>>>> Stashed changes

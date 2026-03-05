@@ -3,23 +3,16 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import hmac
 import io
-import json
 import os
-import re
-import smtplib
-import ssl
 import sys
 import tarfile
 import zipfile
 from datetime import datetime
-from email.message import EmailMessage
 from pathlib import Path
-from threading import Lock
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -28,35 +21,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-
-def _load_local_env_file(path: Path) -> None:
-    """Load KEY=VALUE lines from local env file if present."""
-    if not path.exists():
-        return
-
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-
-        if not key:
-            continue
-
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-
-        os.environ.setdefault(key, value)
-
-
-_load_local_env_file(PROJECT_ROOT / ".env.smtp.local")
-_load_local_env_file(PROJECT_ROOT / ".env.smtp")
-
-from backend.model_core import XGBoostMalwareModel
+from backend.model_core import (
+    LightGBMMalwareModel,
+    RandomForestMalwareModel,
+    URLPhishingModel,
+    XGBoostMalwareModel,
+    flatten_ember_features,
+)
 from backend.pe_to_features import (
+    extract_raw_from_bytes,
     extract_model_features_from_bytes,
     extractor_diagnostics,
     extractor_available,
@@ -64,29 +37,55 @@ from backend.pe_to_features import (
 )
 
 
-MODEL_PATH = Path(
+XGBOOST_MODEL_PATH = Path(
     os.getenv("MODEL_PATH", PROJECT_ROOT / "models" / "xgboost_malware_model.json")
 )
-MODEL_METADATA_PATH = Path(
+XGBOOST_METADATA_PATH = Path(
     os.getenv("MODEL_METADATA_PATH", PROJECT_ROOT / "models" / "model_metadata.json")
+)
+LIGHTGBM_MODEL_PATH = Path(
+    os.getenv("LIGHTGBM_MODEL_PATH", PROJECT_ROOT / "models" / "lightgbm_malware_model.txt")
+)
+LIGHTGBM_METADATA_PATH = Path(
+    os.getenv("LIGHTGBM_METADATA_PATH", PROJECT_ROOT / "models" / "lightgbm_model_metadata.json")
+)
+RANDOM_FOREST_MODEL_PATH = Path(
+    os.getenv(
+        "RANDOM_FOREST_MODEL_PATH",
+        PROJECT_ROOT / "models" / "random_forest_malware_model.joblib",
+    )
+)
+RANDOM_FOREST_METADATA_PATH = Path(
+    os.getenv(
+        "RANDOM_FOREST_METADATA_PATH",
+        PROJECT_ROOT / "models" / "random_forest_model_metadata.json",
+    )
+)
+URL_PHISH_MODEL_PATH = Path(
+    os.getenv("URL_PHISH_MODEL_PATH", PROJECT_ROOT / "models" / "url_phishing_model.joblib")
+)
+URL_PHISH_METADATA_PATH = Path(
+    os.getenv(
+        "URL_PHISH_METADATA_PATH",
+        PROJECT_ROOT / "models" / "url_phishing_model_metadata.json",
+    )
 )
 PE_ALLOWED_SUFFIXES = (
     ".exe",
     ".dll",
     ".sys",
     ".scr",
+    ".com",
+    ".ax",
+    ".tlb",
+    ".ime",
+    ".acm",
     ".drv",
     ".cpl",
     ".ocx",
     ".efi",
     ".mui",
 )
-CONTACT_DEFAULT_RECIPIENTS = [
-    "badinabogdan21@stud.ase.ro",
-    "voicueduard22@stud.ase.ro",
-    "chiriacmario21@stud.ase.ro",
-]
-EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MSI_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 RAR_MAGIC_V4 = b"Rar!\x1A\x07\x00"
 RAR_MAGIC_V5 = b"Rar!\x1A\x07\x01\x00"
@@ -96,36 +95,6 @@ MAX_ARCHIVE_ENTRIES = int(os.getenv("MAX_ARCHIVE_ENTRIES", "5000"))
 MAX_ARCHIVE_MEMBER_BYTES = int(os.getenv("MAX_ARCHIVE_MEMBER_BYTES", "26214400"))  # 25 MB
 MAX_ARCHIVE_SCAN_FILES = int(os.getenv("MAX_ARCHIVE_SCAN_FILES", "1000"))
 ARCHIVE_SUPPORTED_FORMATS = [".zip", ".tar", ".tar.gz", ".tar.bz2", ".tar.xz", ".rar", ".7z"]
-CONTACT_MESSAGES_PATH = Path(
-    os.getenv("CONTACT_MESSAGES_PATH", PROJECT_ROOT / "reports" / "contact_messages.txt")
-)
-CONTACT_ADMIN_MAX_LIMIT = int(os.getenv("CONTACT_ADMIN_MAX_LIMIT", "500"))
-ADMIN_PAGE_PASSWORD = os.getenv("ADMIN_PAGE_PASSWORD", "test")
-CONTACT_FILE_LOCK = Lock()
-DEFAULT_ROC_CURVE_POINTS = [
-    [0.0, 0.0],
-    [0.01, 0.36],
-    [0.03, 0.61],
-    [0.06, 0.75],
-    [0.1, 0.84],
-    [0.18, 0.91],
-    [0.3, 0.95],
-    [1.0, 1.0],
-]
-DEFAULT_CORRELATION_LABELS = [
-    "Byte entropy",
-    "PE headers",
-    "Import graph",
-    "Section stats",
-    "String signals",
-]
-DEFAULT_CORRELATION_MATRIX = [
-    [1.0, 0.72, -0.18, 0.54, 0.33],
-    [0.72, 1.0, -0.12, 0.47, 0.28],
-    [-0.18, -0.12, 1.0, -0.41, -0.22],
-    [0.54, 0.47, -0.41, 1.0, 0.36],
-    [0.33, 0.28, -0.22, 0.36, 1.0],
-]
 
 
 def _parse_allowed_origins() -> tuple[List[str], bool]:
@@ -139,100 +108,63 @@ def _parse_allowed_origins() -> tuple[List[str], bool]:
     return origins, allow_credentials
 
 
-def _to_float(value: object, fallback: float) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return fallback
-    if parsed != parsed:  # NaN
-        return fallback
-    return parsed
-
-
-def _normalize_confusion_matrix(matrix: object) -> List[List[int]]:
-    if (
-        isinstance(matrix, list)
-        and len(matrix) == 2
-        and all(isinstance(row, list) and len(row) == 2 for row in matrix)
-    ):
-        return [
-            [max(0, int(round(_to_float(matrix[0][0], 0.0)))), max(0, int(round(_to_float(matrix[0][1], 0.0))))],
-            [max(0, int(round(_to_float(matrix[1][0], 0.0)))), max(0, int(round(_to_float(matrix[1][1], 0.0))))],
-        ]
-    return [[0, 0], [0, 0]]
-
-
-def _normalize_roc_curve_points(points: object) -> List[List[float]]:
-    if not isinstance(points, list):
-        return DEFAULT_ROC_CURVE_POINTS
-
-    normalized: List[List[float]] = []
-    for item in points:
-        if not isinstance(item, (list, tuple)) or len(item) != 2:
-            continue
-        x = min(1.0, max(0.0, _to_float(item[0], 0.0)))
-        y = min(1.0, max(0.0, _to_float(item[1], 0.0)))
-        normalized.append([x, y])
-
-    if len(normalized) < 2:
-        return DEFAULT_ROC_CURVE_POINTS
-
-    normalized.sort(key=lambda pair: (pair[0], pair[1]))
-    if normalized[0][0] > 0.0:
-        normalized.insert(0, [0.0, 0.0])
-    if normalized[-1][0] < 1.0:
-        normalized.append([1.0, 1.0])
-    return normalized
-
-
-def _normalize_correlation_matrix(matrix: object) -> List[List[float]]:
-    if not isinstance(matrix, list) or not matrix:
-        return DEFAULT_CORRELATION_MATRIX
-
-    parsed_rows: List[List[float]] = []
-    for row in matrix:
-        if not isinstance(row, list) or not row:
-            continue
-        parsed_rows.append([max(-1.0, min(1.0, _to_float(value, 0.0))) for value in row])
-
-    if not parsed_rows:
-        return DEFAULT_CORRELATION_MATRIX
-
-    min_width = min(len(row) for row in parsed_rows)
-    size = min(len(parsed_rows), min_width)
-    if size < 2:
-        return DEFAULT_CORRELATION_MATRIX
-
-    return [row[:size] for row in parsed_rows[:size]]
-
-
-def _normalize_correlation_labels(labels: object, size: int) -> List[str]:
-    if size <= 0:
-        return []
-    if isinstance(labels, list):
-        normalized = [str(label).strip() for label in labels if str(label).strip()]
-        if len(normalized) >= size:
-            return normalized[:size]
-
-    if size == len(DEFAULT_CORRELATION_LABELS):
-        return DEFAULT_CORRELATION_LABELS
-    return [f"Feature {idx + 1}" for idx in range(size)]
-
-
 allowed_origins, allow_credentials = _parse_allowed_origins()
 
 runtime_model: Optional[XGBoostMalwareModel] = None
+runtime_predict_models: Dict[str, Any] = {}
+runtime_unavailable_models: Dict[str, str] = {}
+runtime_url_model: Optional[URLPhishingModel] = None
+runtime_url_model_error: Optional[str] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global runtime_model
+    global runtime_model, runtime_predict_models, runtime_unavailable_models
+    global runtime_url_model, runtime_url_model_error
+    runtime_predict_models = {}
+    runtime_unavailable_models = {}
+    runtime_url_model = None
+    runtime_url_model_error = None
+
     runtime_model = XGBoostMalwareModel(
-        model_path=MODEL_PATH,
-        metadata_path=MODEL_METADATA_PATH,
+        model_path=XGBOOST_MODEL_PATH,
+        metadata_path=XGBOOST_METADATA_PATH,
     )
-    print(f"Model loaded: {MODEL_PATH}")
+    runtime_predict_models["xgboost"] = runtime_model
+    print(f"Model loaded [xgboost]: {XGBOOST_MODEL_PATH}")
     print(f"Feature count: {runtime_model.feature_count}")
+
+    try:
+        runtime_predict_models["lightgbm"] = LightGBMMalwareModel(
+            model_path=LIGHTGBM_MODEL_PATH,
+            metadata_path=LIGHTGBM_METADATA_PATH,
+        )
+        print(f"Model loaded [lightgbm]: {LIGHTGBM_MODEL_PATH}")
+    except Exception as exc:
+        runtime_unavailable_models["lightgbm"] = str(exc)
+        print(f"Model unavailable [lightgbm]: {exc}")
+
+    try:
+        runtime_predict_models["random_forest"] = RandomForestMalwareModel(
+            model_path=RANDOM_FOREST_MODEL_PATH,
+            metadata_path=RANDOM_FOREST_METADATA_PATH,
+        )
+        print(f"Model loaded [random_forest]: {RANDOM_FOREST_MODEL_PATH}")
+    except Exception as exc:
+        runtime_unavailable_models["random_forest"] = str(exc)
+        print(f"Model unavailable [random_forest]: {exc}")
+
+    try:
+        runtime_url_model = URLPhishingModel(
+            model_path=URL_PHISH_MODEL_PATH,
+            metadata_path=URL_PHISH_METADATA_PATH,
+        )
+        print(f"Model loaded [url_phishing]: {URL_PHISH_MODEL_PATH}")
+    except Exception as exc:
+        runtime_url_model_error = str(exc)
+        print(f"Model unavailable [url_phishing]: {exc}")
+
+    print(f"Comparative models available: {list(runtime_predict_models.keys())}")
     try:
         yield
     finally:
@@ -240,9 +172,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="XGBoost Malware Detector API",
-    description="REST API for malware detection using XGBoost.",
-    version="1.1.0",
+    title="Malware Detector API",
+    description="REST API for malware detection with comparative multi-model scoring.",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -260,6 +192,43 @@ class PredictionResponse(BaseModel):
     probability_malware: float
     confidence: float
     sha256: Optional[str] = None
+
+
+class ModelPredictionResponse(BaseModel):
+    model_name: str
+    model_type: str
+    prediction: str
+    probability_malware: float
+    confidence: float
+    threshold: float
+    input_features: int
+
+
+class PredictionComparisonResponse(PredictionResponse):
+    file_name: str
+    file_type: str
+    primary_model: str
+    consensus_prediction: str
+    consensus_probability_malware: float
+    consensus_confidence: float
+    votes: Dict[str, int]
+    models: Dict[str, ModelPredictionResponse]
+    unavailable_models: Dict[str, str]
+
+
+class URLPredictionRequest(BaseModel):
+    url: str
+
+
+class URLPredictionResponse(BaseModel):
+    url: str
+    normalized_url: str
+    prediction: str
+    probability_phishing: float
+    confidence: float
+    threshold: float
+    model_type: str
+    created_at: str
 
 
 class ArchiveFileResult(BaseModel):
@@ -285,39 +254,36 @@ class ArchiveScanResponse(BaseModel):
     timestamp: str
 
 
-class ContactMessageRequest(BaseModel):
-    name: str
-    email: str
-    subject: str
-    message: str
-
-
-class ContactMessageResponse(BaseModel):
-    success: bool
-    detail: str
-    message_id: str
-    saved_to: str
-    recipients: List[str]
-
-
-class ContactMessageRecord(BaseModel):
-    message_id: str
-    created_at: str
-    name: str
-    email: str
-    subject: str
-    message: str
-
-
-class ContactMessagesResponse(BaseModel):
-    total: int
-    items: List[ContactMessageRecord]
-
-
 def require_model() -> XGBoostMalwareModel:
     if runtime_model is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
     return runtime_model
+
+
+def require_predict_models() -> Dict[str, Any]:
+    if not runtime_predict_models:
+        raise HTTPException(status_code=500, detail="No prediction models loaded")
+    return runtime_predict_models
+
+
+def require_url_model() -> URLPhishingModel:
+    if runtime_url_model is None:
+        detail = "URL phishing model is not loaded."
+        if runtime_url_model_error:
+            detail = (
+                f"{detail} {runtime_url_model_error} "
+                "Train it with scripts/train_phishing_url_model.py and restart backend."
+            )
+        raise HTTPException(status_code=503, detail=detail)
+    return runtime_url_model
+
+
+def _pick_primary_model_name(model_names: Iterable[str]) -> str:
+    names = set(model_names)
+    for preferred in ("lightgbm", "xgboost", "random_forest"):
+        if preferred in names:
+            return preferred
+    return sorted(names)[0]
 
 
 def _is_probable_pe(filename: str, data: bytes) -> bool:
@@ -414,177 +380,10 @@ def _iter_archive_entries(archive_type: str, data: bytes) -> Iterable[Tuple[str,
     raise RuntimeError("Unsupported archive format. Supported: zip, tar, rar, 7z.")
 
 
-def _contact_recipients() -> List[str]:
-    raw = os.getenv("CONTACT_TO_EMAILS")
-    if raw:
-        recipients = [item.strip() for item in raw.split(",") if item.strip()]
-    else:
-        recipients = CONTACT_DEFAULT_RECIPIENTS.copy()
-    return recipients
-
-
-def _validate_contact_payload(payload: ContactMessageRequest) -> ContactMessageRequest:
-    name = payload.name.strip()
-    email = payload.email.strip()
-    subject = payload.subject.strip()
-    message = payload.message.strip()
-
-    if len(name) < 2 or len(name) > 120:
-        raise HTTPException(status_code=422, detail="Name must be between 2 and 120 characters.")
-    if len(subject) < 3 or len(subject) > 180:
-        raise HTTPException(status_code=422, detail="Subject must be between 3 and 180 characters.")
-    if len(message) < 10 or len(message) > 5000:
-        raise HTTPException(status_code=422, detail="Message must be between 10 and 5000 characters.")
-    if not EMAIL_PATTERN.match(email):
-        raise HTTPException(status_code=422, detail="Sender email is invalid.")
-
-    return ContactMessageRequest(
-        name=name,
-        email=email,
-        subject=subject,
-        message=message,
-    )
-
-
-def _persist_contact_message(payload: ContactMessageRequest) -> ContactMessageRecord:
-    CONTACT_MESSAGES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().isoformat()
-    message_id = f"msg-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-    record = ContactMessageRecord(
-        message_id=message_id,
-        created_at=timestamp,
-        name=payload.name,
-        email=payload.email,
-        subject=payload.subject,
-        message=payload.message,
-    )
-
-    serialized = json.dumps(record.model_dump(), ensure_ascii=False)
-    with CONTACT_FILE_LOCK:
-        with CONTACT_MESSAGES_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(serialized + "\n")
-
-    return record
-
-
-def _read_contact_messages(limit: int = 100) -> List[ContactMessageRecord]:
-    if not CONTACT_MESSAGES_PATH.exists():
-        return []
-
-    rows: List[ContactMessageRecord] = []
-    safe_limit = max(1, min(limit, CONTACT_ADMIN_MAX_LIMIT))
-
-    with CONTACT_FILE_LOCK:
-        lines = CONTACT_MESSAGES_PATH.read_text(encoding="utf-8").splitlines()
-
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            parsed = json.loads(line)
-            rows.append(ContactMessageRecord(**parsed))
-        except Exception:
-            # Skip malformed rows without interrupting admin page.
-            continue
-
-    return list(reversed(rows[-safe_limit:]))
-
-
-def _assert_admin_access(password: Optional[str]) -> None:
-    provided = (password or "").strip()
-    if not provided or not hmac.compare_digest(provided, ADMIN_PAGE_PASSWORD):
-        raise HTTPException(status_code=401, detail="Admin authentication failed.")
-
-
-def _send_contact_email(payload: ContactMessageRequest) -> List[str]:
-    smtp_host = os.getenv("CONTACT_SMTP_HOST", "").strip()
-    smtp_port = int(os.getenv("CONTACT_SMTP_PORT", "587"))
-    smtp_user = os.getenv("CONTACT_SMTP_USER", "").strip()
-    smtp_password = os.getenv("CONTACT_SMTP_PASSWORD", "").strip()
-    smtp_secure = os.getenv("CONTACT_SMTP_SECURE", "starttls").strip().lower()
-    sender = os.getenv("CONTACT_FROM_EMAIL", smtp_user).strip()
-    recipients = _contact_recipients()
-
-    if not smtp_host or not sender:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Contact mail service is not configured. "
-                "Set CONTACT_SMTP_HOST and CONTACT_FROM_EMAIL (or CONTACT_SMTP_USER)."
-            ),
-        )
-    if not recipients:
-        raise HTTPException(status_code=503, detail="No contact recipients configured.")
-    if smtp_user and not smtp_password:
-        raise HTTPException(
-            status_code=503,
-            detail="CONTACT_SMTP_PASSWORD is required when CONTACT_SMTP_USER is set.",
-        )
-
-    email_message = EmailMessage()
-    email_message["Subject"] = f"[m-virus] {payload.subject}"
-    email_message["From"] = sender
-    email_message["To"] = ", ".join(recipients)
-    email_message["Reply-To"] = payload.email
-    email_message.set_content(
-        "\n".join(
-            [
-                "New contact request from m-virus UI",
-                f"Timestamp: {datetime.now().isoformat()}",
-                f"Name: {payload.name}",
-                f"Sender: {payload.email}",
-                "",
-                "Message:",
-                payload.message,
-            ]
-        )
-    )
-
-    timeout_seconds = 20
-    try:
-        if smtp_secure == "ssl":
-            context = ssl.create_default_context()
-            with smtplib.SMTP_SSL(
-                host=smtp_host,
-                port=smtp_port,
-                timeout=timeout_seconds,
-                context=context,
-            ) as server:
-                if smtp_user:
-                    server.login(smtp_user, smtp_password)
-                server.send_message(email_message)
-        else:
-            with smtplib.SMTP(host=smtp_host, port=smtp_port, timeout=timeout_seconds) as server:
-                server.ehlo()
-                if smtp_secure == "starttls":
-                    context = ssl.create_default_context()
-                    server.starttls(context=context)
-                    server.ehlo()
-                if smtp_user:
-                    server.login(smtp_user, smtp_password)
-                server.send_message(email_message)
-    except smtplib.SMTPAuthenticationError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Email authentication failed (SMTP 535). "
-                "Check CONTACT_SMTP_USER/CONTACT_SMTP_PASSWORD and verify that SMTP access "
-                "is enabled for this mailbox."
-            ),
-        ) from exc
-    except smtplib.SMTPException as exc:
-        raise HTTPException(status_code=502, detail=f"Email delivery failed: {exc}") from exc
-    except OSError as exc:
-        raise HTTPException(status_code=502, detail=f"Email service connection failed: {exc}") from exc
-
-    return recipients
-
-
 @app.get("/")
 async def root():
     return {
-        "name": "XGBoost Malware Detector API",
+        "name": "Multi-Model Malware Detector API",
         "version": app.version,
         "status": "running",
         "docs": "/docs",
@@ -594,20 +393,26 @@ async def root():
 @app.get("/health")
 async def health_check():
     model = runtime_model
+    loaded_models = sorted(runtime_predict_models.keys())
     return {
         "status": "healthy" if model is not None else "degraded",
         "model_loaded": model is not None,
-        "model_path": str(MODEL_PATH),
+        "model_path": str(XGBOOST_MODEL_PATH),
         "input_features": model.feature_count if model else None,
+        "loaded_prediction_models": loaded_models,
+        "unavailable_prediction_models": dict(runtime_unavailable_models),
+        "url_model_loaded": runtime_url_model is not None,
+        "url_model_path": str(URL_PHISH_MODEL_PATH),
+        "url_model_error": runtime_url_model_error,
         "pe_file_extraction_available": extractor_available(),
         "pe_file_extraction_diagnostics": extractor_diagnostics(),
         "timestamp": datetime.now().isoformat(),
     }
 
 
-@app.post("/predict-file", response_model=PredictionResponse)
+@app.post("/predict-file", response_model=PredictionComparisonResponse)
 async def predict_file(file: UploadFile = File(...)):
-    model = require_model()
+    predict_models = require_predict_models()
 
     if not extractor_available():
         raise HTTPException(
@@ -655,12 +460,82 @@ async def predict_file(file: UploadFile = File(...)):
         )
 
     try:
-        features, _raw = extract_model_features_from_bytes(data, model.feature_count)
+        raw = extract_raw_from_bytes(data)
+        base_features = flatten_ember_features(raw)
+        if base_features.size == 0:
+            raise RuntimeError("Feature extractor produced an empty feature vector")
+
         file_sha = sha256_bytes(data)
-        result = model.predict_one(features=features, sha256=file_sha)
-        return result
+        model_results: Dict[str, ModelPredictionResponse] = {}
+
+        for model_name, model_obj in predict_models.items():
+            model_pred = model_obj.predict_one(features=base_features, sha256=file_sha)
+            model_results[model_name] = ModelPredictionResponse(
+                model_name=model_name,
+                model_type=model_obj.metadata.get("model_type", model_obj.__class__.__name__),
+                prediction=model_pred["prediction"],
+                probability_malware=float(model_pred["probability_malware"]),
+                confidence=float(model_pred["confidence"]),
+                threshold=float(model_obj.threshold),
+                input_features=int(model_obj.feature_count),
+            )
+
+        primary_model_name = _pick_primary_model_name(model_results.keys())
+        primary_result = model_results[primary_model_name]
+
+        malware_votes = sum(
+            1 for result in model_results.values() if result.prediction == "Malware"
+        )
+        benign_votes = len(model_results) - malware_votes
+        if malware_votes > benign_votes:
+            consensus_prediction = "Malware"
+        elif benign_votes > malware_votes:
+            consensus_prediction = "Benign"
+        else:
+            consensus_prediction = primary_result.prediction
+
+        consensus_probability = float(
+            sum(result.probability_malware for result in model_results.values())
+            / len(model_results)
+        )
+        consensus_confidence = float(max(consensus_probability, 1.0 - consensus_probability))
+
+        return PredictionComparisonResponse(
+            prediction=primary_result.prediction,
+            probability_malware=primary_result.probability_malware,
+            confidence=primary_result.confidence,
+            sha256=file_sha,
+            file_name=filename,
+            file_type="pe",
+            primary_model=primary_model_name,
+            consensus_prediction=consensus_prediction,
+            consensus_probability_malware=consensus_probability,
+            consensus_confidence=consensus_confidence,
+            votes={"malware": malware_votes, "benign": benign_votes},
+            models=model_results,
+            unavailable_models=dict(runtime_unavailable_models),
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not extract PE features: {exc}") from exc
+
+
+@app.post("/predict-url", response_model=URLPredictionResponse)
+async def predict_url(request: URLPredictionRequest):
+    model = require_url_model()
+
+    raw_url = (request.url or "").strip()
+    if not raw_url:
+        raise HTTPException(status_code=400, detail="URL is empty")
+    if len(raw_url) > 8192:
+        raise HTTPException(status_code=400, detail="URL is too long (max 8192 characters)")
+
+    try:
+        result = model.predict_one(raw_url)
+        return URLPredictionResponse(**result)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not analyze URL: {exc}") from exc
 
 
 @app.post("/scan-archive", response_model=ArchiveScanResponse)
@@ -784,10 +659,39 @@ async def model_info():
     meta = model.metadata
 
     metrics = meta.get("metrics", {}) if isinstance(meta.get("metrics"), dict) else {}
-    confusion_matrix = _normalize_confusion_matrix(meta.get("confusion_matrix"))
-    roc_curve_points = _normalize_roc_curve_points(meta.get("roc_curve_points"))
-    correlation_matrix = _normalize_correlation_matrix(meta.get("correlation_matrix"))
-    correlation_labels = _normalize_correlation_labels(meta.get("correlation_labels"), len(correlation_matrix))
+    loaded_models: Dict[str, Dict[str, Any]] = {}
+    for model_name, model_obj in runtime_predict_models.items():
+        loaded_models[model_name] = {
+            "model_type": model_obj.metadata.get("model_type", model_obj.__class__.__name__),
+            "model_path": str(model_obj.model_path),
+            "input_features": int(model_obj.feature_count),
+            "threshold": float(model_obj.threshold),
+            "metrics": model_obj.metadata.get("metrics"),
+            "created_at": model_obj.metadata.get("created_at"),
+        }
+
+    primary_model_name = (
+        _pick_primary_model_name(loaded_models.keys()) if loaded_models else None
+    )
+    url_model_info: Dict[str, Any]
+    if runtime_url_model is not None:
+        url_model_info = {
+            "loaded": True,
+            "model_type": runtime_url_model.model_type,
+            "model_path": str(runtime_url_model.model_path),
+            "metadata_path": str(runtime_url_model.metadata_path),
+            "input_features": runtime_url_model.feature_count,
+            "threshold": runtime_url_model.threshold,
+            "metrics": runtime_url_model.metadata.get("metrics"),
+            "created_at": runtime_url_model.metadata.get("created_at", runtime_url_model.created_at),
+        }
+    else:
+        url_model_info = {
+            "loaded": False,
+            "model_path": str(URL_PHISH_MODEL_PATH),
+            "metadata_path": str(URL_PHISH_METADATA_PATH),
+            "error": runtime_url_model_error,
+        }
 
     return {
         "model_type": meta.get("model_type", "XGBoost Binary Classifier"),
@@ -796,9 +700,20 @@ async def model_info():
         "output_classes": 2,
         "classes": ["Benign", "Malware"],
         "threshold": model.threshold,
+        "predict_file_mode": "comparative_multi_model",
+        "predict_file_primary_model": primary_model_name,
+        "loaded_prediction_models": loaded_models,
+        "unavailable_prediction_models": dict(runtime_unavailable_models),
+        "predict_url_enabled": runtime_url_model is not None,
+        "predict_url_model": url_model_info,
+        "predict_url_notes": (
+            "POST /predict-url performs lexical phishing detection on the URL string only. "
+            "It does not fetch the webpage content."
+        ),
         "predict_file_supported_extensions": list(PE_ALLOWED_SUFFIXES),
         "predict_file_support_notes": (
-            "EMBER extractor supports PE binaries only. "
+            "Comparative scoring runs all loaded models (LightGBM/XGBoost/RandomForest) on the same PE features. "
+            "Supports known PE extensions and any file with valid MZ header. "
             "Formats like .msi require unpacking to PE payloads before scanning."
         ),
         "predict_archive_supported_formats": ARCHIVE_SUPPORTED_FORMATS,
@@ -821,42 +736,11 @@ async def model_info():
         "precision": metrics.get("precision"),
         "recall": metrics.get("recall"),
         "f1_score": metrics.get("f1_score"),
-        "confusion_matrix": confusion_matrix,
-        "roc_curve_points": roc_curve_points,
-        "correlation_labels": correlation_labels,
-        "correlation_matrix": correlation_matrix,
         "created_at": meta.get("created_at"),
         "notes": meta.get("notes"),
         "bodmas_included": meta.get("bodmas_included"),
         "training_info": meta.get("training_info"),
     }
-
-
-@app.post("/contact-message", response_model=ContactMessageResponse)
-async def contact_message(payload: ContactMessageRequest):
-    validated = _validate_contact_payload(payload)
-    saved = _persist_contact_message(validated)
-    recipients = _contact_recipients()
-    return ContactMessageResponse(
-        success=True,
-        detail="Message saved successfully.",
-        message_id=saved.message_id,
-        saved_to=str(CONTACT_MESSAGES_PATH),
-        recipients=recipients,
-    )
-
-
-@app.get("/admin/contact-messages", response_model=ContactMessagesResponse)
-async def admin_contact_messages(
-    limit: int = Query(100, ge=1, le=1000),
-    x_admin_password: Optional[str] = Header(default=None, alias="X-Admin-Password"),
-):
-    _assert_admin_access(x_admin_password)
-    rows = _read_contact_messages(limit=limit)
-    return ContactMessagesResponse(
-        total=len(rows),
-        items=rows,
-    )
 
 
 @app.exception_handler(HTTPException)

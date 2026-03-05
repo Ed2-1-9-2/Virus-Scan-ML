@@ -1,7 +1,7 @@
-fastapi==0.104.1
+FastAPI==0.104.1
 uvicorn==0.24.0
 xgboost==2.0.3
-numpy==1.26.4
+numpy==1.24.3
 pandas==2.1.3
 scikit-learn==1.3.2
 pydantic==2.5.0

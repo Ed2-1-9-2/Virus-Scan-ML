@@ -163,7 +163,7 @@ fastapi==0.104.1        ✅ API framework
 uvicorn==0.24.0         ✅ ASGI server
 xgboost==2.0.3          ✅ ML model
 scikit-learn==1.3.2     ✅ Preprocessing
-numpy==2.4.2            ✅ Numerics
+numpy==1.24.3           ✅ Numerics
 pandas==2.0.3           ✅ Data processing
 requests==2.31.0        ✅ HTTP client
 python-multipart==0.0.6 ✅ File uploads

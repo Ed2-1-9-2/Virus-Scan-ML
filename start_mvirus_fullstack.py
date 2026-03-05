@@ -156,6 +156,12 @@ def update_repo(repo_root: Path) -> None:
     if not git_path:
         return
 
+    # Avoid noisy/failed pulls when user has local modifications.
+    code, output = run_command([git_path, "-C", str(repo_root), "status", "--porcelain"], timeout=60)
+    if code == 0 and output.strip():
+        print("[launcher] git update skipped: local changes detected in repository.")
+        return
+
     code, output = run_command([git_path, "-C", str(repo_root), "fetch", "origin", REPO_BRANCH], timeout=180)
     if code != 0:
         print(f"[launcher] git fetch skipped: {output}")

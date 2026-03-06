@@ -14,8 +14,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -49,12 +50,7 @@ LIGHTGBM_MODEL_PATH = Path(
 LIGHTGBM_METADATA_PATH = Path(
     os.getenv("LIGHTGBM_METADATA_PATH", PROJECT_ROOT / "models" / "lightgbm_model_metadata.json")
 )
-RANDOM_FOREST_MODEL_PATH = Path(
-    os.getenv(
-        "RANDOM_FOREST_MODEL_PATH",
-        PROJECT_ROOT / "models" / "random_forest_malware_model.joblib",
-    )
-)
+RANDOM_FOREST_MODEL_PATH_ENV = os.getenv("RANDOM_FOREST_MODEL_PATH")
 RANDOM_FOREST_METADATA_PATH = Path(
     os.getenv(
         "RANDOM_FOREST_METADATA_PATH",
@@ -95,6 +91,29 @@ MAX_ARCHIVE_ENTRIES = int(os.getenv("MAX_ARCHIVE_ENTRIES", "5000"))
 MAX_ARCHIVE_MEMBER_BYTES = int(os.getenv("MAX_ARCHIVE_MEMBER_BYTES", "26214400"))  # 25 MB
 MAX_ARCHIVE_SCAN_FILES = int(os.getenv("MAX_ARCHIVE_SCAN_FILES", "1000"))
 ARCHIVE_SUPPORTED_FORMATS = [".zip", ".tar", ".tar.gz", ".tar.bz2", ".tar.xz", ".rar", ".7z"]
+FRONTEND_BUILD_DIR = Path(
+    os.getenv("FRONTEND_BUILD_DIR", str(PROJECT_ROOT.parent / "m-virus-ui" / "build"))
+).resolve()
+FRONTEND_INDEX_FILE = FRONTEND_BUILD_DIR / "index.html"
+FRONTEND_STATIC_DIR = FRONTEND_BUILD_DIR / "static"
+
+
+def _resolve_random_forest_model_path() -> Path:
+    """Resolve RandomForest model path with backward-compatible fallbacks."""
+    if RANDOM_FOREST_MODEL_PATH_ENV and RANDOM_FOREST_MODEL_PATH_ENV.strip():
+        return Path(RANDOM_FOREST_MODEL_PATH_ENV.strip())
+
+    candidates = [
+        PROJECT_ROOT / "models" / "random_forest_malware_model.joblib",
+        PROJECT_ROOT / "models" / "random_forest_model.joblib",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+RANDOM_FOREST_MODEL_PATH = _resolve_random_forest_model_path()
 
 
 def _parse_allowed_origins() -> tuple[List[str], bool]:
@@ -106,6 +125,25 @@ def _parse_allowed_origins() -> tuple[List[str], bool]:
     # Browsers reject allow_credentials=True with wildcard origin.
     allow_credentials = "*" not in origins
     return origins, allow_credentials
+
+
+def frontend_build_available() -> bool:
+    """Return True when production frontend assets are available."""
+    return FRONTEND_INDEX_FILE.exists() and FRONTEND_STATIC_DIR.exists()
+
+
+def _resolve_frontend_asset(asset_path: str) -> Optional[Path]:
+    """Resolve a build asset path safely (prevent path traversal)."""
+    if not asset_path:
+        return None
+
+    candidate = (FRONTEND_BUILD_DIR / asset_path).resolve()
+    if candidate != FRONTEND_BUILD_DIR and FRONTEND_BUILD_DIR not in candidate.parents:
+        return None
+
+    if candidate.is_file():
+        return candidate
+    return None
 
 
 allowed_origins, allow_credentials = _parse_allowed_origins()
@@ -195,6 +233,8 @@ class PredictionResponse(BaseModel):
 
 
 class ModelPredictionResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     model_name: str
     model_type: str
     prediction: str
@@ -221,6 +261,8 @@ class URLPredictionRequest(BaseModel):
 
 
 class URLPredictionResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     url: str
     normalized_url: str
     prediction: str
@@ -406,6 +448,8 @@ async def health_check():
         "url_model_error": runtime_url_model_error,
         "pe_file_extraction_available": extractor_available(),
         "pe_file_extraction_diagnostics": extractor_diagnostics(),
+        "frontend_build_available": frontend_build_available(),
+        "frontend_app_path": "/app" if frontend_build_available() else None,
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -467,17 +511,30 @@ async def predict_file(file: UploadFile = File(...)):
 
         file_sha = sha256_bytes(data)
         model_results: Dict[str, ModelPredictionResponse] = {}
+        unavailable_models = dict(runtime_unavailable_models)
 
         for model_name, model_obj in predict_models.items():
-            model_pred = model_obj.predict_one(features=base_features, sha256=file_sha)
-            model_results[model_name] = ModelPredictionResponse(
-                model_name=model_name,
-                model_type=model_obj.metadata.get("model_type", model_obj.__class__.__name__),
-                prediction=model_pred["prediction"],
-                probability_malware=float(model_pred["probability_malware"]),
-                confidence=float(model_pred["confidence"]),
-                threshold=float(model_obj.threshold),
-                input_features=int(model_obj.feature_count),
+            try:
+                model_pred = model_obj.predict_one(features=base_features, sha256=file_sha)
+                model_results[model_name] = ModelPredictionResponse(
+                    model_name=model_name,
+                    model_type=model_obj.metadata.get("model_type", model_obj.__class__.__name__),
+                    prediction=model_pred["prediction"],
+                    probability_malware=float(model_pred["probability_malware"]),
+                    confidence=float(model_pred["confidence"]),
+                    threshold=float(model_obj.threshold),
+                    input_features=int(model_obj.feature_count),
+                )
+            except Exception as model_exc:
+                unavailable_models[model_name] = f"Prediction failed: {model_exc}"
+
+        if not model_results:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "No prediction models could analyze this file. "
+                    f"Failures: {unavailable_models}"
+                ),
             )
 
         primary_model_name = _pick_primary_model_name(model_results.keys())
@@ -513,7 +570,7 @@ async def predict_file(file: UploadFile = File(...)):
             consensus_confidence=consensus_confidence,
             votes={"malware": malware_votes, "benign": benign_votes},
             models=model_results,
-            unavailable_models=dict(runtime_unavailable_models),
+            unavailable_models=unavailable_models,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not extract PE features: {exc}") from exc
@@ -661,13 +718,23 @@ async def model_info():
     metrics = meta.get("metrics", {}) if isinstance(meta.get("metrics"), dict) else {}
     loaded_models: Dict[str, Dict[str, Any]] = {}
     for model_name, model_obj in runtime_predict_models.items():
+        model_meta = model_obj.metadata if isinstance(model_obj.metadata, dict) else {}
         loaded_models[model_name] = {
-            "model_type": model_obj.metadata.get("model_type", model_obj.__class__.__name__),
+            "model_name": model_name,
+            "model_type": model_meta.get("model_type", model_obj.__class__.__name__),
             "model_path": str(model_obj.model_path),
             "input_features": int(model_obj.feature_count),
             "threshold": float(model_obj.threshold),
-            "metrics": model_obj.metadata.get("metrics"),
-            "created_at": model_obj.metadata.get("created_at"),
+            "metrics": model_meta.get("metrics"),
+            "confusion_matrix": model_meta.get("confusion_matrix"),
+            "roc_curve_points": model_meta.get("roc_curve_points"),
+            "correlation_matrix": model_meta.get("correlation_matrix"),
+            "correlation_labels": model_meta.get("correlation_labels"),
+            "training_samples": model_meta.get("training_samples"),
+            "test_samples": model_meta.get("test_samples"),
+            "created_at": model_meta.get("created_at"),
+            "notes": model_meta.get("notes"),
+            "training_info": model_meta.get("training_info"),
         }
 
     primary_model_name = (
@@ -675,19 +742,34 @@ async def model_info():
     )
     url_model_info: Dict[str, Any]
     if runtime_url_model is not None:
+        url_meta = (
+            runtime_url_model.metadata
+            if isinstance(runtime_url_model.metadata, dict)
+            else {}
+        )
         url_model_info = {
             "loaded": True,
+            "model_name": "url_phishing",
             "model_type": runtime_url_model.model_type,
             "model_path": str(runtime_url_model.model_path),
             "metadata_path": str(runtime_url_model.metadata_path),
             "input_features": runtime_url_model.feature_count,
             "threshold": runtime_url_model.threshold,
-            "metrics": runtime_url_model.metadata.get("metrics"),
-            "created_at": runtime_url_model.metadata.get("created_at", runtime_url_model.created_at),
+            "metrics": url_meta.get("metrics"),
+            "confusion_matrix": url_meta.get("confusion_matrix"),
+            "roc_curve_points": url_meta.get("roc_curve_points"),
+            "correlation_matrix": url_meta.get("correlation_matrix"),
+            "correlation_labels": url_meta.get("correlation_labels"),
+            "training_samples": url_meta.get("training_samples"),
+            "test_samples": url_meta.get("test_samples"),
+            "notes": url_meta.get("notes"),
+            "training_info": url_meta.get("training_info"),
+            "created_at": url_meta.get("created_at", runtime_url_model.created_at),
         }
     else:
         url_model_info = {
             "loaded": False,
+            "model_name": "url_phishing",
             "model_path": str(URL_PHISH_MODEL_PATH),
             "metadata_path": str(URL_PHISH_METADATA_PATH),
             "error": runtime_url_model_error,
@@ -702,6 +784,7 @@ async def model_info():
         "threshold": model.threshold,
         "predict_file_mode": "comparative_multi_model",
         "predict_file_primary_model": primary_model_name,
+        "models_catalog": sorted(loaded_models.keys()),
         "loaded_prediction_models": loaded_models,
         "unavailable_prediction_models": dict(runtime_unavailable_models),
         "predict_url_enabled": runtime_url_model is not None,
@@ -736,10 +819,26 @@ async def model_info():
         "precision": metrics.get("precision"),
         "recall": metrics.get("recall"),
         "f1_score": metrics.get("f1_score"),
+        "confusion_matrix": meta.get("confusion_matrix"),
+        "roc_curve_points": meta.get("roc_curve_points"),
+        "correlation_matrix": meta.get("correlation_matrix"),
+        "correlation_labels": meta.get("correlation_labels"),
         "created_at": meta.get("created_at"),
         "notes": meta.get("notes"),
         "bodmas_included": meta.get("bodmas_included"),
         "training_info": meta.get("training_info"),
+        "frontend_build_available": frontend_build_available(),
+        "frontend_app_path": "/app" if frontend_build_available() else None,
+    }
+
+
+@app.get("/frontend-status")
+async def frontend_status():
+    return {
+        "frontend_build_available": frontend_build_available(),
+        "frontend_build_dir": str(FRONTEND_BUILD_DIR),
+        "frontend_index_file": str(FRONTEND_INDEX_FILE),
+        "frontend_app_path": "/app" if frontend_build_available() else None,
     }
 
 
@@ -749,6 +848,26 @@ async def http_exception_handler(request, exc):
         status_code=exc.status_code,
         content={"detail": exc.detail, "error": True},
     )
+
+
+if frontend_build_available():
+    app.mount(
+        "/app/static",
+        StaticFiles(directory=str(FRONTEND_STATIC_DIR)),
+        name="frontend_static",
+    )
+
+    @app.get("/app", include_in_schema=False)
+    @app.get("/app/", include_in_schema=False)
+    async def frontend_index():
+        return FileResponse(str(FRONTEND_INDEX_FILE))
+
+    @app.get("/app/{asset_path:path}", include_in_schema=False)
+    async def frontend_asset(asset_path: str):
+        target = _resolve_frontend_asset(asset_path)
+        if target is not None:
+            return FileResponse(str(target))
+        return FileResponse(str(FRONTEND_INDEX_FILE))
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
@@ -115,6 +116,26 @@ def _build_binary_prediction(proba: float, threshold: float, sha256: Optional[st
         "confidence": float(max(proba, 1.0 - proba)),
         "sha256": sha256,
     }
+
+
+def _prepare_numpy_joblib_compat() -> None:
+    """
+    Provide compatibility aliases for joblib artifacts serialized with newer NumPy.
+
+    Some artifacts reference private module paths like `numpy._core.*`.
+    On older NumPy runtimes these modules do not exist; we alias them to
+    available `numpy.core.*` modules so unpickling can proceed.
+    """
+    try:
+        import numpy.core as npcore  # type: ignore
+    except Exception:
+        return
+
+    sys.modules.setdefault("numpy._core", npcore)
+    for submodule in ("multiarray", "numeric", "_multiarray_umath"):
+        target = getattr(npcore, submodule, None)
+        if target is not None:
+            sys.modules.setdefault(f"numpy._core.{submodule}", target)
 
 
 def normalize_url_text(url: str) -> str:
@@ -276,8 +297,14 @@ class RandomForestMalwareModel:
                 "RandomForest runtime dependency is missing. Install it with: pip install joblib scikit-learn"
             ) from exc
 
+        _prepare_numpy_joblib_compat()
         self.model = joblib_load(self.model_path)
         self.metadata = load_metadata(self.metadata_path)
+        if hasattr(self.model, "n_jobs"):
+            try:
+                self.model.n_jobs = 1
+            except Exception:
+                pass
 
         meta_input = self.metadata.get("input_features")
         if isinstance(meta_input, int) and meta_input > 0:

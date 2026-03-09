@@ -18,6 +18,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     roc_auc_score,
+    roc_curve,
 )
 from sklearn.model_selection import train_test_split
 
@@ -130,7 +131,12 @@ def evaluate(y_true: np.ndarray, y_proba: np.ndarray, threshold: float) -> Dict:
     print(f"ROC-AUC  : {metrics['roc_auc']:.4f}")
     print("\nConfusion matrix:")
     print(cm)
-    return {"metrics": metrics, "confusion_matrix": cm.tolist()}
+    fpr, tpr, _ = roc_curve(y_true, y_proba)
+    return {
+        "metrics": metrics,
+        "confusion_matrix": cm.tolist(),
+        "roc_curve_points": [[float(x), float(y)] for x, y in zip(fpr.tolist(), tpr.tolist())],
+    }
 
 
 def main() -> None:
@@ -289,6 +295,7 @@ def main() -> None:
         "dataset_total_samples": int(len(texts)),
         "metrics": evaluation["metrics"],
         "confusion_matrix": evaluation["confusion_matrix"],
+        "roc_curve_points": evaluation.get("roc_curve_points", []),
         "notes": "Trained on phishing-dataset JSON text/label records; designed for URL string inference.",
         "training_info": {
             "vectorizer": "HashingVectorizer(char, 3-5)",
@@ -307,4 +314,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

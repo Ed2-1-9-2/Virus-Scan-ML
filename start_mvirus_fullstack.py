@@ -11,6 +11,7 @@ Behavior on startup:
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import shutil
 import socket
@@ -28,6 +29,10 @@ REPO_DIR_NAME = "Virus-Scan-ML"
 REPO_BRANCH = "main"
 REPO_ZIP_URL = f"https://github.com/Ed2-1-9-2/Virus-Scan-ML/archive/refs/heads/{REPO_BRANCH}.zip"
 FRONTEND_URL = "http://127.0.0.1:3000"
+RANDOM_FOREST_MODEL_RAW_URL = (
+    "https://raw.githubusercontent.com/Ed2-1-9-2/Virus-Scan-ML/main/"
+    "m-virus/models/random_forest_malware_model.joblib"
+)
 
 
 def message_box(text: str, title: str = "Start_MVirus_App") -> None:
@@ -196,16 +201,28 @@ def _python_candidates() -> list[list[str]]:
         ["py", "-3.10"],
         ["py", "-3.11"],
         ["py", "-3.12"],
-        ["py", "-3"],
+        ["py", "-3.13"],
         ["python"],
         ["python3"],
+        ["py", "-3"],
     ]
 
 
-def _probe_python(cmd: list[str]) -> Optional[Tuple[int, int]]:
-    """Return (major, minor) if command is a valid Python interpreter."""
+def _probe_python(cmd: list[str]) -> Optional[Tuple[int, int, str]]:
+    """Return (major, minor, soabi) if command is a valid Python interpreter."""
     code, output = run_command(
-        cmd + ["-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"],
+        cmd
+        + [
+            "-c",
+            (
+                "import json,sys,sysconfig;"
+                "print(json.dumps({"
+                "'major': sys.version_info[0],"
+                "'minor': sys.version_info[1],"
+                "'soabi': (sysconfig.get_config_var('SOABI') or '')"
+                "}))"
+            ),
+        ],
         timeout=30,
     )
     if code != 0:
@@ -215,45 +232,79 @@ def _probe_python(cmd: list[str]) -> Optional[Tuple[int, int]]:
     if not raw:
         return None
 
-    version = raw[-1].strip()
-    parts = version.split(".")
-    if len(parts) != 2:
+    payload_raw = raw[-1].strip()
+    if not payload_raw:
         return None
 
     try:
-        major = int(parts[0])
-        minor = int(parts[1])
-    except ValueError:
+        payload = json.loads(payload_raw)
+        major = int(payload.get("major"))
+        minor = int(payload.get("minor"))
+        soabi = str(payload.get("soabi") or "")
+    except Exception:
         return None
 
-    return major, minor
+    return major, minor, soabi
+
+
+def _is_free_threaded_soabi(soabi: str) -> bool:
+    marker = (soabi or "").lower()
+    return "cp313t" in marker or "cp314t" in marker or "cp315t" in marker
 
 
 def _pick_python_command() -> list[str]:
     """Pick a usable Python command for creating backend venv."""
-    fallback: Optional[list[str]] = None
     for cmd in _python_candidates():
         version = _probe_python(cmd)
         if not version:
             continue
-        major, minor = version
-        if major == 3 and 10 <= minor <= 12:
+        major, minor, soabi = version
+        if major == 3 and 10 <= minor <= 13 and not _is_free_threaded_soabi(soabi):
             return cmd
-        if major == 3 and minor >= 10 and fallback is None:
-            fallback = cmd
-
-    if fallback:
-        return fallback
 
     raise RuntimeError(
-        "Python 3.10+ was not found.\n"
-        "Install Python 3.10/3.11 and ensure command `py` or `python` is available in PATH."
+        "No compatible Python interpreter was found for backend dependencies.\n"
+        "Required: Python 3.10, 3.11, 3.12, or standard 3.13 (64-bit, non free-threaded).\n"
+        "Detected Python 3.13 free-threaded builds (cp313t) are not supported by required wheels.\n"
+        "Install Python 3.12/3.13 (standard build) from python.org and ensure `py -3.12` or `py -3.13` works."
     )
+
+
+def _probe_python_path(python_path: Path) -> Optional[Tuple[int, int, str]]:
+    return _probe_python([str(python_path)])
+
+
+def _is_supported_backend_python(python_path: Path) -> bool:
+    probe = _probe_python_path(python_path)
+    if not probe:
+        return False
+    major, minor, soabi = probe
+    return major == 3 and 10 <= minor <= 13 and not _is_free_threaded_soabi(soabi)
 
 
 def _create_backend_venv(backend_dir: Path) -> Path:
     """Create backend virtual environment and return python executable path."""
+    venv_dir = backend_dir / ".venv"
     backend_python = backend_dir / ".venv" / "Scripts" / "python.exe"
+    if backend_python.exists():
+        if _is_supported_backend_python(backend_python):
+            return backend_python
+        try:
+            shutil.rmtree(venv_dir)
+        except Exception as exc:
+            raise RuntimeError(
+                "Existing backend virtualenv uses unsupported Python runtime and could not be recreated.\n"
+                f"Path: {venv_dir}\n"
+                f"Reason: {exc}"
+            ) from exc
+
+    # Defensive cleanup in case a partial .venv exists.
+    if venv_dir.exists() and not backend_python.exists():
+        try:
+            shutil.rmtree(venv_dir)
+        except Exception:
+            pass
+
     if backend_python.exists():
         return backend_python
 
@@ -266,6 +317,28 @@ def _create_backend_venv(backend_dir: Path) -> Path:
         raise RuntimeError(f"Virtualenv creation completed but python not found: {backend_python}")
 
     return backend_python
+
+
+def _kill_backend_venv_processes(backend_dir: Path) -> None:
+    """Best-effort stop python processes running from backend .venv."""
+    venv_scripts = str((backend_dir / ".venv" / "Scripts").resolve()).replace("\\", "\\\\")
+    ps_cmd = (
+        "$target='" + venv_scripts + "';"
+        "Get-CimInstance Win32_Process "
+        "| Where-Object { "
+        "$_.Name -match '^python(w)?\\.exe$' -and "
+        "$_.ExecutablePath -and $_.ExecutablePath.StartsWith($target, [System.StringComparison]::OrdinalIgnoreCase) "
+        "} "
+        "| ForEach-Object { "
+        "try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} "
+        "}"
+    )
+    run_command(["powershell", "-NoProfile", "-Command", ps_cmd], timeout=30)
+
+
+def _should_retry_backend_install(output: str) -> bool:
+    raw = (output or "").lower()
+    return "winerror 32" in raw or "being used by another process" in raw
 
 
 def _install_backend_requirements(backend_python: Path, backend_dir: Path) -> None:
@@ -289,21 +362,40 @@ def _install_backend_requirements(backend_python: Path, backend_dir: Path) -> No
     if code != 0:
         print(f"[launcher] pip bootstrap warning: {output}")
 
-    code, output = run_command(
-        [
-            str(backend_python),
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "-r",
-            "config/requirements-api.txt",
-        ],
-        cwd=backend_dir,
-        timeout=2400,
-    )
-    if code != 0:
-        raise RuntimeError(f"Could not install backend dependencies:\n{output}")
+    last_output = ""
+    for attempt in range(1, 4):
+        code, output = run_command(
+            [
+                str(backend_python),
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "-r",
+                "config/requirements-api.txt",
+            ],
+            cwd=backend_dir,
+            timeout=2400,
+        )
+        if code == 0:
+            return
+
+        last_output = output
+        if _should_retry_backend_install(output):
+            _kill_backend_venv_processes(backend_dir)
+            if attempt == 2:
+                # Escalate to clean env rebuild after repeated file locks.
+                try:
+                    shutil.rmtree(backend_dir / ".venv")
+                except Exception:
+                    pass
+                backend_python = _create_backend_venv(backend_dir)
+            time.sleep(2)
+            continue
+
+        break
+
+    raise RuntimeError(f"Could not install backend dependencies:\n{last_output}")
 
 
 def _backend_runtime_ready(backend_python: Path, backend_dir: Path) -> tuple[bool, str]:
@@ -313,7 +405,7 @@ def _backend_runtime_ready(backend_python: Path, backend_dir: Path) -> tuple[boo
             str(backend_python),
             "-c",
             (
-                "import fastapi,uvicorn,xgboost,numpy,pandas,sklearn,pydantic;"
+                "import fastapi,uvicorn,xgboost,numpy,pandas,sklearn,pydantic,lightgbm;"
                 "print('ok')"
             ),
         ],
@@ -368,6 +460,108 @@ def _ensure_optional_extractor(backend_python: Path, backend_dir: Path) -> Optio
     return "PE extractor is still unavailable after optional dependency install."
 
 
+def _ensure_random_forest_artifact(backend_python: Path, backend_dir: Path) -> Optional[str]:
+    """
+    Ensure RandomForest artifact exists for comparative scoring.
+
+    Strategy:
+    1) Use existing local artifact if present.
+    2) Try downloading known artifact URL.
+    3) Generate a local fallback artifact via bootstrap script.
+    """
+    models_dir = backend_dir / "models"
+    model_candidates = (
+        models_dir / "random_forest_malware_model.joblib",
+        models_dir / "random_forest_model.joblib",
+    )
+    metadata_path = models_dir / "random_forest_model_metadata.json"
+
+    existing_model = next((candidate for candidate in model_candidates if candidate.exists()), None)
+
+    def _read_json_dict(path: Path) -> dict:
+        if not path.exists():
+            return {}
+        try:
+            with path.open("r", encoding="utf-8-sig") as handle:
+                data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _metadata_needs_bootstrap_refresh(meta: dict) -> bool:
+        if not meta:
+            return False
+        bootstrap_generated = bool(meta.get("bootstrap_generated")) or (
+            isinstance(meta.get("notes"), str)
+            and "bootstrap-generated fallback model" in meta.get("notes", "").lower()
+        )
+        if not bootstrap_generated:
+            return False
+
+        has_metrics = isinstance(meta.get("metrics"), dict) and bool(meta.get("metrics"))
+        has_confusion = isinstance(meta.get("confusion_matrix"), list) and len(meta.get("confusion_matrix")) == 2
+        has_correlation = isinstance(meta.get("correlation_matrix"), list) and len(meta.get("correlation_matrix")) >= 2
+        has_test_samples = isinstance(meta.get("test_samples"), int) and int(meta.get("test_samples")) > 0
+        return not (has_metrics and has_confusion and has_correlation and has_test_samples)
+
+    if existing_model is not None:
+        meta = _read_json_dict(metadata_path)
+        if not _metadata_needs_bootstrap_refresh(meta):
+            return None
+        target_model = existing_model
+    else:
+        target_model = model_candidates[0]
+
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    download_url = os.getenv("RANDOM_FOREST_MODEL_URL", RANDOM_FOREST_MODEL_RAW_URL).strip()
+    if existing_model is None and download_url:
+        try:
+            urllib.request.urlretrieve(download_url, target_model)
+            if target_model.exists() and target_model.stat().st_size > 0:
+                return None
+        except Exception:
+            pass
+        try:
+            if target_model.exists() and target_model.stat().st_size == 0:
+                target_model.unlink()
+        except Exception:
+            pass
+
+    bootstrap_script = backend_dir / "scripts" / "bootstrap_random_forest_model.py"
+    if not bootstrap_script.exists():
+        return (
+            "RandomForest model file is missing and bootstrap script is unavailable. "
+            "Comparative mode will run without RandomForest."
+        )
+
+    code, output = run_command(
+        [
+            str(backend_python),
+            str(bootstrap_script),
+            "--model-out",
+            str(target_model),
+            "--metadata-path",
+            str(metadata_path),
+        ],
+        cwd=backend_dir,
+        timeout=1800,
+    )
+    if code != 0:
+        return (
+            "RandomForest model file is missing and fallback bootstrap failed.\n"
+            f"{output}"
+        )
+
+    if target_model.exists() and target_model.stat().st_size > 0:
+        return (
+            "RandomForest fallback model was generated automatically. "
+            "For best accuracy, replace it with a fully trained artifact."
+        )
+
+    return "RandomForest model is still unavailable after fallback bootstrap."
+
+
 def ensure_backend_python(backend_dir: Path) -> tuple[Path, Optional[str]]:
     """Ensure backend venv exists and required dependencies are installed."""
     backend_python = _create_backend_venv(backend_dir)
@@ -403,7 +597,16 @@ def _frontend_runtime_ready(frontend_dir: Path) -> tuple[bool, str]:
 def _npm_install(frontend_dir: Path, npm_path: str, prefer_ci: bool) -> tuple[int, str]:
     """Install frontend deps with deterministic options when lockfile exists."""
     if prefer_ci and (frontend_dir / "package-lock.json").exists():
-        return run_command([npm_path, "ci", "--no-audit", "--no-fund"], cwd=frontend_dir, timeout=3600)
+        code, output = run_command(
+            [npm_path, "ci", "--no-audit", "--no-fund"],
+            cwd=frontend_dir,
+            timeout=3600,
+        )
+        raw = (output or "").lower()
+        if code != 0 and ("npm error code eusage" in raw or "can only install packages when your package.json and package-lock.json" in raw):
+            # Lockfile mismatch in ZIP snapshots: fallback to npm install.
+            return run_command([npm_path, "install", "--no-audit", "--no-fund"], cwd=frontend_dir, timeout=3600)
+        return code, output
     return run_command([npm_path, "install", "--no-audit", "--no-fund"], cwd=frontend_dir, timeout=3600)
 
 
@@ -470,6 +673,42 @@ def wait_for_http(url: str, timeout_seconds: int = 120) -> tuple[bool, str]:
     return False, last_error
 
 
+def _fetch_json(url: str, timeout_seconds: int = 8) -> Optional[dict]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_seconds) as response:
+            raw = response.read()
+        payload = json.loads(raw.decode("utf-8", errors="replace"))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _backend_needs_reload_from_health(health_payload: Optional[dict]) -> bool:
+    if not isinstance(health_payload, dict):
+        return False
+    loaded = health_payload.get("loaded_prediction_models")
+    if not isinstance(loaded, list):
+        return False
+    normalized = {str(item).strip().lower() for item in loaded}
+    # Ensure comparative stack includes LightGBM when deps are now available.
+    return "lightgbm" not in normalized
+
+
+def _stop_backend_processes() -> None:
+    """Best-effort stop uvicorn backend processes started by launcher."""
+    ps_cmd = (
+        "Get-CimInstance Win32_Process "
+        "| Where-Object { "
+        "$_.Name -match '^python(w)?\\.exe$' -and "
+        "$_.CommandLine -and $_.CommandLine -match 'backend\\.api_backend:app' "
+        "} "
+        "| ForEach-Object { "
+        "try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} "
+        "}"
+    )
+    run_command(["powershell", "-NoProfile", "-Command", ps_cmd], timeout=60)
+
+
 def is_port_in_use(host: str, port: int) -> bool:
     """Return True when a TCP listener responds on host:port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -525,6 +764,12 @@ def main() -> int:
     optional_warning: Optional[str] = None
     try:
         backend_python, optional_warning = ensure_backend_python(backend_dir)
+        rf_warning = _ensure_random_forest_artifact(backend_python, backend_dir)
+        if rf_warning:
+            if optional_warning:
+                optional_warning = f"{optional_warning}\n\n{rf_warning}"
+            else:
+                optional_warning = rf_warning
         npm_path = ensure_frontend_dependencies(frontend_dir)
     except Exception as exc:
         message_box(str(exc), title="Launcher dependency error")
@@ -534,6 +779,15 @@ def main() -> int:
     backend_port = 8000
     backend_health_url = f"http://{backend_host}:{backend_port}/health"
     backend_already_running, _backend_probe = wait_for_http(backend_health_url, timeout_seconds=2)
+    if backend_already_running:
+        health_payload = _fetch_json(backend_health_url, timeout_seconds=5)
+        if _backend_needs_reload_from_health(health_payload):
+            print("[launcher] restarting existing backend instance to load missing comparative models.")
+            _stop_backend_processes()
+            time.sleep(1)
+            backend_already_running, _backend_probe = wait_for_http(
+                backend_health_url, timeout_seconds=2
+            )
 
     if not backend_already_running and not is_port_available(backend_host, backend_port):
         fallback_port = find_free_port(backend_host, start=8001, end=9000)

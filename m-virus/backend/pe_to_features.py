@@ -14,10 +14,12 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 
 from backend.model_core import flatten_ember_features, normalize_features
+from backend.portable_pe_features import PortablePEFeatureExtractor
 
 _PE_EXTRACTOR_CLASS = None
 _IMPORT_ERROR: Optional[Exception] = None
 _EXTRACTOR = None
+_EXTRACTOR_KIND = "unresolved"
 
 
 def _patch_numpy_compat() -> None:
@@ -61,7 +63,7 @@ def _load_pe_extractor_class():
     2) If that fails (often due optional deps in ember.__init__), load
        `ember/features.py` directly and import PEFeatureExtractor only.
     """
-    global _PE_EXTRACTOR_CLASS, _IMPORT_ERROR
+    global _PE_EXTRACTOR_CLASS, _IMPORT_ERROR, _EXTRACTOR_KIND
 
     if _PE_EXTRACTOR_CLASS is not None:
         return _PE_EXTRACTOR_CLASS
@@ -80,6 +82,7 @@ def _load_pe_extractor_class():
             except Exception:
                 pass
             _PE_EXTRACTOR_CLASS = cls
+            _EXTRACTOR_KIND = "ember"
             return _PE_EXTRACTOR_CLASS
     except Exception as exc:  # pragma: no cover - optional dependency path
         _IMPORT_ERROR = exc
@@ -103,11 +106,14 @@ def _load_pe_extractor_class():
                     cls = getattr(module, "PEFeatureExtractor", None)
                     if cls is not None:
                         _PE_EXTRACTOR_CLASS = cls
+                        _EXTRACTOR_KIND = "ember_features_py"
                         return _PE_EXTRACTOR_CLASS
     except Exception as exc:  # pragma: no cover - optional dependency path
         _IMPORT_ERROR = exc
 
-    return None
+    _PE_EXTRACTOR_CLASS = PortablePEFeatureExtractor
+    _EXTRACTOR_KIND = "portable_builtin"
+    return _PE_EXTRACTOR_CLASS
 
 
 def extractor_available() -> bool:
@@ -116,7 +122,16 @@ def extractor_available() -> bool:
 
 def extractor_diagnostics() -> str:
     if extractor_available():
-        return "available"
+        if _EXTRACTOR_KIND == "portable_builtin":
+            if _IMPORT_ERROR is not None:
+                return (
+                    "available: built-in portable PE extractor fallback "
+                    f"(EMBER import failed: {_IMPORT_ERROR.__class__.__name__}: {_IMPORT_ERROR})"
+                )
+            return "available: built-in portable PE extractor fallback"
+        if _EXTRACTOR_KIND == "ember_features_py":
+            return "available: ember/features.py direct load"
+        return "available: ember"
 
     if _IMPORT_ERROR is not None:
         return f"unavailable: {_IMPORT_ERROR.__class__.__name__}: {_IMPORT_ERROR}"

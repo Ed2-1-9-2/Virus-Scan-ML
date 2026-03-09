@@ -328,6 +328,117 @@ def _pick_primary_model_name(model_names: Iterable[str]) -> str:
     return sorted(names)[0]
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        if isinstance(value, bool):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _is_valid_correlation_matrix(matrix: Any) -> bool:
+    if not isinstance(matrix, list) or len(matrix) < 2:
+        return False
+    size = len(matrix)
+    for row in matrix:
+        if not isinstance(row, list) or len(row) < size:
+            return False
+        for item in row[:size]:
+            if _safe_float(item) is None:
+                return False
+    return True
+
+
+def _normalize_confusion_matrix(confusion: Any) -> Optional[List[List[float]]]:
+    if (
+        not isinstance(confusion, list)
+        or len(confusion) != 2
+        or not isinstance(confusion[0], list)
+        or not isinstance(confusion[1], list)
+        or len(confusion[0]) != 2
+        or len(confusion[1]) != 2
+    ):
+        return None
+
+    tn = _safe_float(confusion[0][0])
+    fp = _safe_float(confusion[0][1])
+    fn = _safe_float(confusion[1][0])
+    tp = _safe_float(confusion[1][1])
+    if None in (tn, fp, fn, tp):
+        return None
+
+    return [
+        [max(0.0, float(tn)), max(0.0, float(fp))],
+        [max(0.0, float(fn)), max(0.0, float(tp))],
+    ]
+
+
+def _build_similarity_correlation(values: List[float]) -> List[List[float]]:
+    if len(values) < 2:
+        return []
+
+    matrix: List[List[float]] = []
+    for i, vi in enumerate(values):
+        row: List[float] = []
+        for j, vj in enumerate(values):
+            if i == j:
+                row.append(1.0)
+                continue
+            # Similarity in [0,1] mapped to correlation-like score in [-1,1].
+            corr = 1.0 - 2.0 * min(1.0, abs(float(vi) - float(vj)))
+            row.append(float(max(-1.0, min(1.0, corr))))
+        matrix.append(row)
+    return matrix
+
+
+def _resolve_correlation_artifacts(
+    model_meta: Dict[str, Any],
+) -> Tuple[Optional[List[List[float]]], Optional[List[str]]]:
+    existing_matrix = model_meta.get("correlation_matrix")
+    existing_labels = model_meta.get("correlation_labels")
+    if _is_valid_correlation_matrix(existing_matrix):
+        matrix = existing_matrix  # type: ignore[assignment]
+        size = len(matrix)  # type: ignore[arg-type]
+        if isinstance(existing_labels, list) and len(existing_labels) >= size:
+            labels = [str(item) for item in existing_labels[:size]]
+        else:
+            labels = [f"F{i + 1}" for i in range(size)]
+        return matrix, labels
+
+    metrics = model_meta.get("metrics")
+    if isinstance(metrics, dict):
+        metric_order = [
+            ("accuracy", "Accuracy"),
+            ("precision", "Precision"),
+            ("recall", "Recall"),
+            ("f1_score", "F1"),
+            ("roc_auc", "ROC-AUC"),
+        ]
+        values: List[float] = []
+        labels: List[str] = []
+        for key, label in metric_order:
+            value = _safe_float(metrics.get(key))
+            if value is None:
+                continue
+            values.append(float(max(0.0, min(1.0, value))))
+            labels.append(label)
+        if len(values) >= 2:
+            return _build_similarity_correlation(values), labels
+
+    normalized_confusion = _normalize_confusion_matrix(model_meta.get("confusion_matrix"))
+    if normalized_confusion is not None:
+        tn, fp = normalized_confusion[0]
+        fn, tp = normalized_confusion[1]
+        total = tn + fp + fn + tp
+        if total > 0:
+            values = [tn / total, fp / total, fn / total, tp / total]
+            labels = ["TN share", "FP share", "FN share", "TP share"]
+            return _build_similarity_correlation(values), labels
+
+    return None, None
+
+
 def _is_probable_pe(filename: str, data: bytes) -> bool:
     lower_name = filename.lower()
     return lower_name.endswith(PE_ALLOWED_SUFFIXES) or data.startswith(b"MZ")
@@ -719,6 +830,7 @@ async def model_info():
     loaded_models: Dict[str, Dict[str, Any]] = {}
     for model_name, model_obj in runtime_predict_models.items():
         model_meta = model_obj.metadata if isinstance(model_obj.metadata, dict) else {}
+        corr_matrix, corr_labels = _resolve_correlation_artifacts(model_meta)
         loaded_models[model_name] = {
             "model_name": model_name,
             "model_type": model_meta.get("model_type", model_obj.__class__.__name__),
@@ -728,8 +840,8 @@ async def model_info():
             "metrics": model_meta.get("metrics"),
             "confusion_matrix": model_meta.get("confusion_matrix"),
             "roc_curve_points": model_meta.get("roc_curve_points"),
-            "correlation_matrix": model_meta.get("correlation_matrix"),
-            "correlation_labels": model_meta.get("correlation_labels"),
+            "correlation_matrix": corr_matrix,
+            "correlation_labels": corr_labels,
             "training_samples": model_meta.get("training_samples"),
             "test_samples": model_meta.get("test_samples"),
             "created_at": model_meta.get("created_at"),
@@ -747,6 +859,7 @@ async def model_info():
             if isinstance(runtime_url_model.metadata, dict)
             else {}
         )
+        url_corr_matrix, url_corr_labels = _resolve_correlation_artifacts(url_meta)
         url_model_info = {
             "loaded": True,
             "model_name": "url_phishing",
@@ -758,8 +871,8 @@ async def model_info():
             "metrics": url_meta.get("metrics"),
             "confusion_matrix": url_meta.get("confusion_matrix"),
             "roc_curve_points": url_meta.get("roc_curve_points"),
-            "correlation_matrix": url_meta.get("correlation_matrix"),
-            "correlation_labels": url_meta.get("correlation_labels"),
+            "correlation_matrix": url_corr_matrix,
+            "correlation_labels": url_corr_labels,
             "training_samples": url_meta.get("training_samples"),
             "test_samples": url_meta.get("test_samples"),
             "notes": url_meta.get("notes"),
@@ -774,6 +887,8 @@ async def model_info():
             "metadata_path": str(URL_PHISH_METADATA_PATH),
             "error": runtime_url_model_error,
         }
+
+    top_corr_matrix, top_corr_labels = _resolve_correlation_artifacts(meta)
 
     return {
         "model_type": meta.get("model_type", "XGBoost Binary Classifier"),
@@ -821,8 +936,8 @@ async def model_info():
         "f1_score": metrics.get("f1_score"),
         "confusion_matrix": meta.get("confusion_matrix"),
         "roc_curve_points": meta.get("roc_curve_points"),
-        "correlation_matrix": meta.get("correlation_matrix"),
-        "correlation_labels": meta.get("correlation_labels"),
+        "correlation_matrix": top_corr_matrix,
+        "correlation_labels": top_corr_labels,
         "created_at": meta.get("created_at"),
         "notes": meta.get("notes"),
         "bodmas_included": meta.get("bodmas_included"),

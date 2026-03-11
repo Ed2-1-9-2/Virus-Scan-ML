@@ -6,6 +6,7 @@ This project was bootstrapped with [Create React App](https://github.com/faceboo
 
 - Project source code license: proprietary (`UNLICENSED`).
 - See [LICENSE.md](./LICENSE.md) for full terms.
+- End-user use terms: see [EULA.md](./EULA.md).
 - Third-party dependency licenses: see `THIRD_PARTY_NOTICES.json`.
 
 ## Available Scripts

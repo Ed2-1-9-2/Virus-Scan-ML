@@ -1070,6 +1070,7 @@ async def model_info(_user: AuthenticatedUser = Depends(require_auth_user)):
             "created_at": model_meta.get("created_at"),
             "notes": model_meta.get("notes"),
             "training_info": model_meta.get("training_info"),
+            "bootstrap_generated": bool(model_meta.get("bootstrap_generated")),
         }
 
     primary_model_name = (

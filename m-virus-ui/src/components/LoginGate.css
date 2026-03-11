@@ -16,6 +16,20 @@
   color: #e9f2ff;
 }
 
+.login-brand {
+  display: grid;
+  grid-template-columns: 52px 1fr;
+  gap: 12px;
+  align-items: center;
+}
+
+.login-brand-icon {
+  width: 52px;
+  height: 52px;
+  object-fit: contain;
+  filter: drop-shadow(0 8px 18px rgba(0, 0, 0, 0.35));
+}
+
 .login-title {
   margin: 0;
   font-size: 1.45rem;

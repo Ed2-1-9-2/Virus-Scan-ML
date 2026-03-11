@@ -104,6 +104,11 @@ FRONTEND_STATIC_DIR = FRONTEND_BUILD_DIR / "static"
 AUTH_DB_PATH = Path(os.getenv("AUTH_DB_PATH", PROJECT_ROOT / "backend" / "auth.db")).resolve()
 AUTH_PASSWORD_ITERATIONS = int(os.getenv("AUTH_PASSWORD_ITERATIONS", "310000"))
 AUTH_MIN_PASSWORD_LENGTH = int(os.getenv("AUTH_MIN_PASSWORD_LENGTH", "8"))
+AUTH_ADMIN_USERS = {
+    value.strip().lower()
+    for value in str(os.getenv("AUTH_ADMIN_USERS", "")).split(",")
+    if value.strip()
+}
 
 
 def _resolve_random_forest_model_path() -> Path:
@@ -313,12 +318,14 @@ class AuthRequest(BaseModel):
 class AuthResponse(BaseModel):
     token: str
     username: str
+    is_admin: bool = False
 
 
 class AuthenticatedUser(BaseModel):
     user_id: int
     username: str
     token: str
+    is_admin: bool = False
 
 
 def require_model() -> XGBoostMalwareModel:
@@ -361,7 +368,8 @@ def _init_auth_db() -> None:
                 username TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
                 salt TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                is_admin INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -379,6 +387,26 @@ def _init_auth_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);"
         )
+
+        # Backward-compatible migration for databases created before admin support.
+        user_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "is_admin" not in user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0;")
+
+        # Ensure there is at least one admin account.
+        admin_count = int(
+            conn.execute("SELECT COUNT(*) AS count FROM users WHERE is_admin = 1").fetchone()["count"]
+        )
+        if admin_count == 0:
+            first_user = conn.execute("SELECT id FROM users ORDER BY id ASC LIMIT 1").fetchone()
+            if first_user is not None:
+                conn.execute(
+                    "UPDATE users SET is_admin = 1 WHERE id = ?",
+                    (int(first_user["id"]),),
+                )
 
 
 def _normalize_username(raw: str) -> str:
@@ -400,6 +428,9 @@ def _normalize_username(raw: str) -> str:
                 "or a valid email address."
             ),
         )
+    # Canonicalize emails to avoid case-sensitive duplicates/login mismatches.
+    if re.fullmatch(email_re, username):
+        return username.lower()
     return username
 
 
@@ -452,7 +483,7 @@ def require_auth_user(authorization: Optional[str] = Header(default=None)) -> Au
     with _db_connect() as conn:
         row = conn.execute(
             """
-            SELECT s.token, u.id as user_id, u.username
+            SELECT s.token, u.id as user_id, u.username, u.is_admin
             FROM sessions s
             JOIN users u ON u.id = s.user_id
             WHERE s.token = ?
@@ -469,7 +500,27 @@ def require_auth_user(authorization: Optional[str] = Header(default=None)) -> Au
             user_id=int(row["user_id"]),
             username=str(row["username"]),
             token=str(row["token"]),
+            is_admin=bool(int(row["is_admin"])),
         )
+
+
+def is_effective_admin(user: AuthenticatedUser) -> bool:
+    if user.is_admin:
+        return True
+    return bool(AUTH_ADMIN_USERS and user.username.lower() in AUTH_ADMIN_USERS)
+
+
+def require_admin_user(user: AuthenticatedUser = Depends(require_auth_user)) -> AuthenticatedUser:
+    """
+    Admin auth layer.
+
+    Access is granted only if:
+    - user has is_admin=1 in DB, OR
+    - user exists in AUTH_ADMIN_USERS env allowlist.
+    """
+    if is_effective_admin(user):
+        return user
+    raise HTTPException(status_code=403, detail="Admin access denied for this account.")
 
 
 def _pick_primary_model_name(model_names: Iterable[str]) -> str:
@@ -701,17 +752,23 @@ async def auth_register(payload: AuthRequest):
         if existing is not None:
             raise HTTPException(status_code=409, detail="Username already exists.")
 
+        users_count = int(conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"])
+        admin_count = int(
+            conn.execute("SELECT COUNT(*) AS count FROM users WHERE is_admin = 1").fetchone()["count"]
+        )
+        is_admin = users_count == 0 or admin_count == 0
+
         cursor = conn.execute(
             """
-            INSERT INTO users(username, password_hash, salt, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO users(username, password_hash, salt, created_at, is_admin)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (username, password_hash, salt_hex, now),
+            (username, password_hash, salt_hex, now, 1 if is_admin else 0),
         )
         user_id = int(cursor.lastrowid)
         token = _create_session(conn, user_id)
 
-    return AuthResponse(token=token, username=username)
+    return AuthResponse(token=token, username=username, is_admin=is_admin)
 
 
 @app.post("/auth/login", response_model=AuthResponse)
@@ -721,7 +778,7 @@ async def auth_login(payload: AuthRequest):
 
     with _db_connect() as conn:
         row = conn.execute(
-            "SELECT id, username, password_hash, salt FROM users WHERE username = ?",
+            "SELECT id, username, password_hash, salt, is_admin FROM users WHERE username = ?",
             (username,),
         ).fetchone()
         if row is None:
@@ -734,12 +791,26 @@ async def auth_login(payload: AuthRequest):
 
         user_id = int(row["id"])
         token = _create_session(conn, user_id)
-        return AuthResponse(token=token, username=str(row["username"]))
+        auth_user = AuthenticatedUser(
+            user_id=user_id,
+            username=str(row["username"]),
+            token=token,
+            is_admin=bool(int(row["is_admin"])),
+        )
+        return AuthResponse(
+            token=token,
+            username=auth_user.username,
+            is_admin=is_effective_admin(auth_user),
+        )
 
 
 @app.get("/auth/me")
 async def auth_me(user: AuthenticatedUser = Depends(require_auth_user)):
-    return {"username": user.username, "authenticated": True}
+    return {
+        "username": user.username,
+        "authenticated": True,
+        "is_admin": is_effective_admin(user),
+    }
 
 
 @app.post("/auth/logout")
@@ -1178,6 +1249,26 @@ async def frontend_status(_user: AuthenticatedUser = Depends(require_auth_user))
         "frontend_build_dir": str(FRONTEND_BUILD_DIR),
         "frontend_index_file": str(FRONTEND_INDEX_FILE),
         "frontend_app_path": "/app" if frontend_build_available() else None,
+    }
+
+
+@app.get("/admin")
+async def admin_endpoint(user: AuthenticatedUser = Depends(require_admin_user)):
+    with _db_connect() as conn:
+        users_count = int(conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"])
+        sessions_count = int(conn.execute("SELECT COUNT(*) AS count FROM sessions").fetchone()["count"])
+
+    return {
+        "admin_user": user.username,
+        "is_admin": is_effective_admin(user),
+        "auth_admin_users_configured": sorted(AUTH_ADMIN_USERS),
+        "users_count": users_count,
+        "active_sessions_count": sessions_count,
+        "loaded_prediction_models": sorted(runtime_predict_models.keys()),
+        "unavailable_prediction_models": dict(runtime_unavailable_models),
+        "url_model_loaded": runtime_url_model is not None,
+        "frontend_build_available": frontend_build_available(),
+        "timestamp": datetime.now().isoformat(),
     }
 
 

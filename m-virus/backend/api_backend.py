@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import io
+import hashlib
+import hmac
 import os
+import secrets
+import sqlite3
 import sys
 import tarfile
 import zipfile
@@ -12,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -96,6 +100,9 @@ FRONTEND_BUILD_DIR = Path(
 ).resolve()
 FRONTEND_INDEX_FILE = FRONTEND_BUILD_DIR / "index.html"
 FRONTEND_STATIC_DIR = FRONTEND_BUILD_DIR / "static"
+AUTH_DB_PATH = Path(os.getenv("AUTH_DB_PATH", PROJECT_ROOT / "backend" / "auth.db")).resolve()
+AUTH_PASSWORD_ITERATIONS = int(os.getenv("AUTH_PASSWORD_ITERATIONS", "310000"))
+AUTH_MIN_PASSWORD_LENGTH = int(os.getenv("AUTH_MIN_PASSWORD_LENGTH", "8"))
 
 
 def _resolve_random_forest_model_path() -> Path:
@@ -163,6 +170,7 @@ async def lifespan(app: FastAPI):
     runtime_unavailable_models = {}
     runtime_url_model = None
     runtime_url_model_error = None
+    _init_auth_db()
 
     runtime_model = XGBoostMalwareModel(
         model_path=XGBOOST_MODEL_PATH,
@@ -296,6 +304,22 @@ class ArchiveScanResponse(BaseModel):
     timestamp: str
 
 
+class AuthRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AuthResponse(BaseModel):
+    token: str
+    username: str
+
+
+class AuthenticatedUser(BaseModel):
+    user_id: int
+    username: str
+    token: str
+
+
 def require_model() -> XGBoostMalwareModel:
     if runtime_model is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
@@ -318,6 +342,126 @@ def require_url_model() -> URLPhishingModel:
             )
         raise HTTPException(status_code=503, detail=detail)
     return runtime_url_model
+
+
+def _db_connect() -> sqlite3.Connection:
+    AUTH_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(AUTH_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_auth_db() -> None:
+    with _db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);"
+        )
+
+
+def _normalize_username(raw: str) -> str:
+    username = str(raw or "").strip()
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="Username must have at least 3 characters.")
+    if len(username) > 64:
+        raise HTTPException(status_code=400, detail="Username must have at most 64 characters.")
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    if any(ch not in allowed for ch in username):
+        raise HTTPException(
+            status_code=400,
+            detail="Username can contain only letters, numbers, dot, underscore, and hyphen.",
+        )
+    return username
+
+
+def _validate_password(raw: str) -> str:
+    password = str(raw or "")
+    if len(password) < AUTH_MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must have at least {AUTH_MIN_PASSWORD_LENGTH} characters.",
+        )
+    if len(password) > 256:
+        raise HTTPException(status_code=400, detail="Password is too long.")
+    return password
+
+
+def _hash_password(password: str, salt_hex: str) -> str:
+    salt = bytes.fromhex(salt_hex)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        AUTH_PASSWORD_ITERATIONS,
+    )
+    return digest.hex()
+
+
+def _create_session(conn: sqlite3.Connection, user_id: int) -> str:
+    now = datetime.utcnow().isoformat()
+    token = secrets.token_urlsafe(48)
+    conn.execute(
+        "INSERT INTO sessions(token, user_id, created_at, last_seen_at) VALUES (?, ?, ?, ?)",
+        (token, user_id, now, now),
+    )
+    return token
+
+
+def _extract_bearer_token(authorization: Optional[str]) -> str:
+    raw = str(authorization or "").strip()
+    if not raw.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    token = raw[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing access token.")
+    return token
+
+
+def require_auth_user(authorization: Optional[str] = Header(default=None)) -> AuthenticatedUser:
+    token = _extract_bearer_token(authorization)
+    now = datetime.utcnow().isoformat()
+    with _db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT s.token, u.id as user_id, u.username
+            FROM sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token = ?
+            """,
+            (token,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=401, detail="Session expired or invalid token.")
+        conn.execute(
+            "UPDATE sessions SET last_seen_at = ? WHERE token = ?",
+            (now, token),
+        )
+        return AuthenticatedUser(
+            user_id=int(row["user_id"]),
+            username=str(row["username"]),
+            token=str(row["token"]),
+        )
 
 
 def _pick_primary_model_name(model_names: Iterable[str]) -> str:
@@ -533,6 +677,70 @@ def _iter_archive_entries(archive_type: str, data: bytes) -> Iterable[Tuple[str,
     raise RuntimeError("Unsupported archive format. Supported: zip, tar, rar, 7z.")
 
 
+@app.post("/auth/register", response_model=AuthResponse)
+async def auth_register(payload: AuthRequest):
+    username = _normalize_username(payload.username)
+    password = _validate_password(payload.password)
+    salt_hex = secrets.token_hex(16)
+    password_hash = _hash_password(password, salt_hex)
+    now = datetime.utcnow().isoformat()
+
+    with _db_connect() as conn:
+        existing = conn.execute(
+            "SELECT id FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+        if existing is not None:
+            raise HTTPException(status_code=409, detail="Username already exists.")
+
+        cursor = conn.execute(
+            """
+            INSERT INTO users(username, password_hash, salt, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (username, password_hash, salt_hex, now),
+        )
+        user_id = int(cursor.lastrowid)
+        token = _create_session(conn, user_id)
+
+    return AuthResponse(token=token, username=username)
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+async def auth_login(payload: AuthRequest):
+    username = _normalize_username(payload.username)
+    password = _validate_password(payload.password)
+
+    with _db_connect() as conn:
+        row = conn.execute(
+            "SELECT id, username, password_hash, salt FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=401, detail="Invalid username or password.")
+
+        expected_hash = str(row["password_hash"])
+        actual_hash = _hash_password(password, str(row["salt"]))
+        if not hmac.compare_digest(expected_hash, actual_hash):
+            raise HTTPException(status_code=401, detail="Invalid username or password.")
+
+        user_id = int(row["id"])
+        token = _create_session(conn, user_id)
+        return AuthResponse(token=token, username=str(row["username"]))
+
+
+@app.get("/auth/me")
+async def auth_me(user: AuthenticatedUser = Depends(require_auth_user)):
+    return {"username": user.username, "authenticated": True}
+
+
+@app.post("/auth/logout")
+async def auth_logout(user: AuthenticatedUser = Depends(require_auth_user)):
+    with _db_connect() as conn:
+        conn.execute("DELETE FROM sessions WHERE token = ?", (user.token,))
+    return {"success": True}
+
+
 @app.get("/")
 async def root():
     return {
@@ -566,7 +774,10 @@ async def health_check():
 
 
 @app.post("/predict-file", response_model=PredictionComparisonResponse)
-async def predict_file(file: UploadFile = File(...)):
+async def predict_file(
+    file: UploadFile = File(...),
+    _user: AuthenticatedUser = Depends(require_auth_user),
+):
     predict_models = require_predict_models()
 
     if not extractor_available():
@@ -688,7 +899,10 @@ async def predict_file(file: UploadFile = File(...)):
 
 
 @app.post("/predict-url", response_model=URLPredictionResponse)
-async def predict_url(request: URLPredictionRequest):
+async def predict_url(
+    request: URLPredictionRequest,
+    _user: AuthenticatedUser = Depends(require_auth_user),
+):
     model = require_url_model()
 
     raw_url = (request.url or "").strip()
@@ -710,6 +924,7 @@ async def predict_url(request: URLPredictionRequest):
 async def scan_archive(
     file: UploadFile = File(...),
     result_limit: int = Query(200, ge=0, le=2000),
+    _user: AuthenticatedUser = Depends(require_auth_user),
 ):
     model = require_model()
 
@@ -822,7 +1037,7 @@ async def scan_archive(
 
 
 @app.get("/model-info")
-async def model_info():
+async def model_info(_user: AuthenticatedUser = Depends(require_auth_user)):
     model = require_model()
     meta = model.metadata
 
@@ -948,7 +1163,7 @@ async def model_info():
 
 
 @app.get("/frontend-status")
-async def frontend_status():
+async def frontend_status(_user: AuthenticatedUser = Depends(require_auth_user)):
     return {
         "frontend_build_available": frontend_build_available(),
         "frontend_build_dir": str(FRONTEND_BUILD_DIR),

@@ -104,6 +104,11 @@ FRONTEND_STATIC_DIR = FRONTEND_BUILD_DIR / "static"
 AUTH_DB_PATH = Path(os.getenv("AUTH_DB_PATH", PROJECT_ROOT / "backend" / "auth.db")).resolve()
 AUTH_PASSWORD_ITERATIONS = int(os.getenv("AUTH_PASSWORD_ITERATIONS", "310000"))
 AUTH_MIN_PASSWORD_LENGTH = int(os.getenv("AUTH_MIN_PASSWORD_LENGTH", "8"))
+AUTH_ADMIN_USERS = {
+    value.strip().lower()
+    for value in str(os.getenv("AUTH_ADMIN_USERS", "")).split(",")
+    if value.strip()
+}
 
 
 def _resolve_random_forest_model_path() -> Path:
@@ -470,6 +475,18 @@ def require_auth_user(authorization: Optional[str] = Header(default=None)) -> Au
             username=str(row["username"]),
             token=str(row["token"]),
         )
+
+
+def require_admin_user(user: AuthenticatedUser = Depends(require_auth_user)) -> AuthenticatedUser:
+    """
+    Admin auth layer.
+
+    If AUTH_ADMIN_USERS is set (comma-separated usernames/emails), access is
+    restricted to those identities. If empty, any authenticated user is allowed.
+    """
+    if AUTH_ADMIN_USERS and user.username.lower() not in AUTH_ADMIN_USERS:
+        raise HTTPException(status_code=403, detail="Admin access denied for this account.")
+    return user
 
 
 def _pick_primary_model_name(model_names: Iterable[str]) -> str:
@@ -1178,6 +1195,25 @@ async def frontend_status(_user: AuthenticatedUser = Depends(require_auth_user))
         "frontend_build_dir": str(FRONTEND_BUILD_DIR),
         "frontend_index_file": str(FRONTEND_INDEX_FILE),
         "frontend_app_path": "/app" if frontend_build_available() else None,
+    }
+
+
+@app.get("/admin")
+async def admin_endpoint(user: AuthenticatedUser = Depends(require_admin_user)):
+    with _db_connect() as conn:
+        users_count = int(conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"])
+        sessions_count = int(conn.execute("SELECT COUNT(*) AS count FROM sessions").fetchone()["count"])
+
+    return {
+        "admin_user": user.username,
+        "auth_admin_users_configured": sorted(AUTH_ADMIN_USERS),
+        "users_count": users_count,
+        "active_sessions_count": sessions_count,
+        "loaded_prediction_models": sorted(runtime_predict_models.keys()),
+        "unavailable_prediction_models": dict(runtime_unavailable_models),
+        "url_model_loaded": runtime_url_model is not None,
+        "frontend_build_available": frontend_build_available(),
+        "timestamp": datetime.now().isoformat(),
     }
 
 

@@ -11,6 +11,7 @@ const LoginGate = ({ apiBase, onAuthenticated }) => {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const iconSrc = `${process.env.PUBLIC_URL || ''}/malware-observatory-icon.svg`;
 
   const title = useMemo(() => (
     mode === 'login' ? 'Autentificare' : 'Creare cont'
@@ -68,8 +69,13 @@ const LoginGate = ({ apiBase, onAuthenticated }) => {
   return (
     <div className="login-root">
       <div className="login-card">
-        <h1 className="login-title">M-Virus Access</h1>
-        <p className="login-subtitle">Conecteaza-te pentru a accesa dashboard-ul de analiza malware.</p>
+        <div className="login-brand">
+          <img className="login-brand-icon" src={iconSrc} alt="M-Virus icon" />
+          <div>
+            <h1 className="login-title">M-Virus Access</h1>
+            <p className="login-subtitle">Conecteaza-te pentru a accesa dashboard-ul de analiza malware.</p>
+          </div>
+        </div>
 
         <h2 className="login-mode">{title}</h2>
 

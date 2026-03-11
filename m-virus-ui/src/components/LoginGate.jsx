@@ -53,11 +53,12 @@ const LoginGate = ({ apiBase, onAuthenticated }) => {
 
       const token = response?.data?.token;
       const authUsername = response?.data?.username;
+      const isAdmin = Boolean(response?.data?.is_admin);
       if (!token || !authUsername) {
         throw new Error('Raspuns invalid de la server.');
       }
 
-      onAuthenticated({ token, username: authUsername });
+      onAuthenticated({ token, username: authUsername, is_admin: isAdmin });
     } catch (err) {
       const detail = err?.response?.data?.detail;
       setError(detail || err?.message || 'Autentificarea a esuat.');

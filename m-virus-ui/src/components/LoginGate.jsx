@@ -73,7 +73,7 @@ const LoginGate = ({ apiBase, onAuthenticated }) => {
         <div className="login-brand">
           <img className="login-brand-icon" src={iconSrc} alt="M-Virus icon" />
           <div>
-            <h1 className="login-title">M-Virus Access</h1>
+            <h1 className="login-title">Malware Detection Observatory</h1>
             <p className="login-subtitle">Conecteaza-te pentru a accesa dashboard-ul de analiza malware.</p>
           </div>
         </div>

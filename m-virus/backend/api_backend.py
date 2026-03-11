@@ -591,6 +591,13 @@ def _resolve_correlation_artifacts(
     return None, None
 
 
+def _is_bootstrap_fallback_model(model_meta: Dict[str, Any]) -> bool:
+    if bool(model_meta.get("bootstrap_generated")):
+        return True
+    notes = str(model_meta.get("notes") or "").lower()
+    return "bootstrap-generated fallback model" in notes
+
+
 def _is_probable_pe(filename: str, data: bytes) -> bool:
     lower_name = filename.lower()
     return lower_name.endswith(PE_ALLOWED_SUFFIXES) or data.startswith(b"MZ")
@@ -1053,16 +1060,27 @@ async def model_info(_user: AuthenticatedUser = Depends(require_auth_user)):
     loaded_models: Dict[str, Dict[str, Any]] = {}
     for model_name, model_obj in runtime_predict_models.items():
         model_meta = model_obj.metadata if isinstance(model_obj.metadata, dict) else {}
-        corr_matrix, corr_labels = _resolve_correlation_artifacts(model_meta)
+        is_bootstrap_fallback = _is_bootstrap_fallback_model(model_meta)
+        if is_bootstrap_fallback:
+            model_metrics = None
+            confusion_matrix = None
+            roc_curve_points = None
+            corr_matrix = None
+            corr_labels = None
+        else:
+            model_metrics = model_meta.get("metrics")
+            confusion_matrix = model_meta.get("confusion_matrix")
+            roc_curve_points = model_meta.get("roc_curve_points")
+            corr_matrix, corr_labels = _resolve_correlation_artifacts(model_meta)
         loaded_models[model_name] = {
             "model_name": model_name,
             "model_type": model_meta.get("model_type", model_obj.__class__.__name__),
             "model_path": str(model_obj.model_path),
             "input_features": int(model_obj.feature_count),
             "threshold": float(model_obj.threshold),
-            "metrics": model_meta.get("metrics"),
-            "confusion_matrix": model_meta.get("confusion_matrix"),
-            "roc_curve_points": model_meta.get("roc_curve_points"),
+            "metrics": model_metrics,
+            "confusion_matrix": confusion_matrix,
+            "roc_curve_points": roc_curve_points,
             "correlation_matrix": corr_matrix,
             "correlation_labels": corr_labels,
             "training_samples": model_meta.get("training_samples"),
@@ -1070,6 +1088,7 @@ async def model_info(_user: AuthenticatedUser = Depends(require_auth_user)):
             "created_at": model_meta.get("created_at"),
             "notes": model_meta.get("notes"),
             "training_info": model_meta.get("training_info"),
+            "bootstrap_generated": is_bootstrap_fallback,
         }
 
     primary_model_name = (

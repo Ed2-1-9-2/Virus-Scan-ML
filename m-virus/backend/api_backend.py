@@ -428,6 +428,9 @@ def _normalize_username(raw: str) -> str:
                 "or a valid email address."
             ),
         )
+    # Canonicalize emails to avoid case-sensitive duplicates/login mismatches.
+    if re.fullmatch(email_re, username):
+        return username.lower()
     return username
 
 

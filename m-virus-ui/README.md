@@ -2,6 +2,12 @@
 
 This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
 
+## Licensing
+
+- Project source code license: proprietary (`UNLICENSED`).
+- See [LICENSE.md](./LICENSE.md) for full terms.
+- Third-party dependency licenses: see `THIRD_PARTY_NOTICES.json`.
+
 ## Available Scripts
 
 In the project directory, you can run:

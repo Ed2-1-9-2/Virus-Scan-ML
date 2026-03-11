@@ -7,6 +7,7 @@ import io
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import sqlite3
 import sys
@@ -384,13 +385,20 @@ def _normalize_username(raw: str) -> str:
     username = str(raw or "").strip()
     if len(username) < 3:
         raise HTTPException(status_code=400, detail="Username must have at least 3 characters.")
-    if len(username) > 64:
-        raise HTTPException(status_code=400, detail="Username must have at most 64 characters.")
-    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
-    if any(ch not in allowed for ch in username):
+    if len(username) > 128:
+        raise HTTPException(status_code=400, detail="Username/email is too long.")
+
+    # Accept either classic username or email-based login.
+    username_re = r"^[A-Za-z0-9._-]{3,64}$"
+    email_re = r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,255}\.[A-Za-z]{2,63}$"
+    if not (re.fullmatch(username_re, username) or re.fullmatch(email_re, username)):
         raise HTTPException(
             status_code=400,
-            detail="Username can contain only letters, numbers, dot, underscore, and hyphen.",
+            detail=(
+                "Username/email invalid. Use either 3-64 chars "
+                "(letters, numbers, dot, underscore, hyphen) "
+                "or a valid email address."
+            ),
         )
     return username
 

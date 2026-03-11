@@ -2,7 +2,7 @@ import React, { useMemo, useState } from 'react';
 import axios from 'axios';
 import './LoginGate.css';
 
-const USERNAME_RE = /^[a-zA-Z0-9._-]{3,64}$/;
+const USERNAME_OR_EMAIL_RE = /^(?:[a-zA-Z0-9._-]{3,64}|[^\s@]+@[^\s@]+\.[^\s@]{2,})$/;
 
 const LoginGate = ({ apiBase, onAuthenticated }) => {
   const [mode, setMode] = useState('login');
@@ -21,8 +21,8 @@ const LoginGate = ({ apiBase, onAuthenticated }) => {
 
   const validate = () => {
     const u = username.trim();
-    if (!USERNAME_RE.test(u)) {
-      return 'Username invalid. Foloseste 3-64 caractere: litere, cifre, punct, underscore, minus.';
+    if (!USERNAME_OR_EMAIL_RE.test(u)) {
+      return 'Username/email invalid. Foloseste username (3-64) sau o adresa de email valida.';
     }
     if (password.length < 8) {
       return 'Parola trebuie sa aiba cel putin 8 caractere.';
@@ -74,7 +74,7 @@ const LoginGate = ({ apiBase, onAuthenticated }) => {
         <h2 className="login-mode">{title}</h2>
 
         <form onSubmit={handleSubmit} className="login-form">
-          <label htmlFor="mv-username">Username</label>
+          <label htmlFor="mv-username">Username sau email</label>
           <input
             id="mv-username"
             type="text"

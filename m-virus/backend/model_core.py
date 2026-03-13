@@ -95,6 +95,33 @@ def load_metadata(metadata_path: Path) -> Dict[str, Any]:
         return {}
 
 
+def _prepare_lightgbm_model_file(model_path: Path) -> Path:
+    """
+    Return a LightGBM model path safe for runtime loading.
+
+    Large LightGBM text models can fail to parse when checked out with CRLF
+    line endings on Windows. When CRLF is detected, write an LF-normalized
+    runtime copy and load that copy instead.
+    """
+    try:
+        raw = model_path.read_bytes()
+    except Exception:
+        return model_path
+
+    if b"\r\n" not in raw:
+        return model_path
+
+    normalized_raw = raw.replace(b"\r\n", b"\n")
+    normalized_path = model_path.with_suffix(model_path.suffix + ".lf")
+
+    try:
+        if not normalized_path.exists() or normalized_path.read_bytes() != normalized_raw:
+            normalized_path.write_bytes(normalized_raw)
+        return normalized_path
+    except Exception:
+        # If normalization fails (permissions/disk), fallback to original path.
+        return model_path
+
 def _resolve_threshold(
     metadata: Dict[str, Any],
     threshold: Optional[float] = None,
@@ -258,7 +285,8 @@ class LightGBMMalwareModel:
                 "LightGBM runtime dependency is missing. Install it with: pip install lightgbm"
             ) from exc
 
-        self.model = lgb.Booster(model_file=str(self.model_path))
+        runtime_model_path = _prepare_lightgbm_model_file(self.model_path)
+        self.model = lgb.Booster(model_file=str(runtime_model_path))
         self.metadata = load_metadata(self.metadata_path)
 
         meta_input = self.metadata.get("input_features")

@@ -55,3 +55,6 @@ m-virus-ui/build/
 # Auth database
 m-virus/backend/auth.db
 m-virus/backend/auth.db-*
+
+# Runtime-normalized LightGBM model copies
+m-virus/models/*.lf

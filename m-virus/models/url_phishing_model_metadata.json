@@ -26,37 +26,6 @@
     ]
   ],
   "notes": "Trained on phishing-dataset JSON text/label records; designed for URL string inference.",
-  "hyperparameter_selection": {
-    "selection_method": "manual_holdout_configuration",
-    "validation_scheme": "train_test_split(stratified holdout)",
-    "objective_metric": "roc_auc",
-    "search_performed": false,
-    "selected_config_name": "default_training_profile",
-    "selection_notes": "The project records the chosen URL model hyperparameters in metadata. No automated grid, random, or Bayesian search is currently stored.",
-    "selected_params": {
-      "vectorizer": {
-        "analyzer": "char",
-        "ngram_range": [
-          3,
-          5
-        ],
-        "n_features": 1048576,
-        "lowercase": true,
-        "alternate_sign": false,
-        "norm": "l2"
-      },
-      "classifier": {
-        "loss": "log_loss",
-        "alpha": 1e-06,
-        "max_iter": 30,
-        "tol": 0.001,
-        "class_weight": "balanced",
-        "early_stopping": true,
-        "n_iter_no_change": 5,
-        "random_state": 42
-      }
-    }
-  },
   "training_info": {
     "vectorizer": "HashingVectorizer(char, 3-5)",
     "classifier": "SGDClassifier(log_loss, class_weight=balanced)",

@@ -33,6 +33,10 @@ RANDOM_FOREST_MODEL_RAW_URL = (
     "https://raw.githubusercontent.com/Ed2-1-9-2/Virus-Scan-ML/main/"
     "m-virus/models/random_forest_malware_model.joblib"
 )
+RANDOM_FOREST_MODEL_MEDIA_URL = (
+    "https://media.githubusercontent.com/media/Ed2-1-9-2/Virus-Scan-ML/main/"
+    "m-virus/models/random_forest_malware_model.joblib"
+)
 
 
 def message_box(text: str, title: str = "Start_MVirus_App") -> None:
@@ -476,8 +480,6 @@ def _ensure_random_forest_artifact(backend_python: Path, backend_dir: Path) -> O
     )
     metadata_path = models_dir / "random_forest_model_metadata.json"
 
-    existing_model = next((candidate for candidate in model_candidates if candidate.exists()), None)
-
     def _read_json_dict(path: Path) -> dict:
         if not path.exists():
             return {}
@@ -504,26 +506,49 @@ def _ensure_random_forest_artifact(backend_python: Path, backend_dir: Path) -> O
         has_test_samples = isinstance(meta.get("test_samples"), int) and int(meta.get("test_samples")) > 0
         return not (has_metrics and has_confusion and has_correlation and has_test_samples)
 
+    def _is_git_lfs_pointer(path: Path) -> bool:
+        if not path.exists() or not path.is_file():
+            return False
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except Exception:
+            return False
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        return bool(lines) and lines[0] == "version https://git-lfs.github.com/spec/v1"
+
+    def _is_usable_model_file(path: Path) -> bool:
+        return path.exists() and path.is_file() and path.stat().st_size > 0 and not _is_git_lfs_pointer(path)
+
+    existing_model = next((candidate for candidate in model_candidates if _is_usable_model_file(candidate)), None)
+    invalid_existing_model = next((candidate for candidate in model_candidates if candidate.exists()), None)
+
     if existing_model is not None:
         meta = _read_json_dict(metadata_path)
         if not _metadata_needs_bootstrap_refresh(meta):
             return None
         target_model = existing_model
     else:
-        target_model = model_candidates[0]
+        target_model = invalid_existing_model or model_candidates[0]
 
     models_dir.mkdir(parents=True, exist_ok=True)
 
-    download_url = os.getenv("RANDOM_FOREST_MODEL_URL", RANDOM_FOREST_MODEL_RAW_URL).strip()
-    if existing_model is None and download_url:
+    download_urls: list[str] = []
+    env_download_url = os.getenv("RANDOM_FOREST_MODEL_URL", "").strip()
+    if env_download_url:
+        download_urls.append(env_download_url)
+    for candidate_url in (RANDOM_FOREST_MODEL_MEDIA_URL, RANDOM_FOREST_MODEL_RAW_URL):
+        if candidate_url and candidate_url not in download_urls:
+            download_urls.append(candidate_url)
+
+    for download_url in download_urls:
         try:
             urllib.request.urlretrieve(download_url, target_model)
-            if target_model.exists() and target_model.stat().st_size > 0:
+            if _is_usable_model_file(target_model):
                 return None
         except Exception:
             pass
         try:
-            if target_model.exists() and target_model.stat().st_size == 0:
+            if target_model.exists():
                 target_model.unlink()
         except Exception:
             pass
@@ -690,8 +715,8 @@ def _backend_needs_reload_from_health(health_payload: Optional[dict]) -> bool:
     if not isinstance(loaded, list):
         return False
     normalized = {str(item).strip().lower() for item in loaded}
-    # Ensure comparative stack includes LightGBM when deps are now available.
-    return "lightgbm" not in normalized
+    # Ensure the comparative stack is complete after launcher repairs.
+    return not {"lightgbm", "random_forest"}.issubset(normalized)
 
 
 def _stop_backend_processes() -> None:

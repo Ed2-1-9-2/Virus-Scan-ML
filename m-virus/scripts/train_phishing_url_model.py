@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -23,6 +24,10 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from backend.metadata_utils import build_hyperparameter_selection
 
 
 def _label_counts(labels: np.ndarray) -> Dict[int, int]:
@@ -283,6 +288,37 @@ def main() -> None:
         "input_features": int(args.n_features),
     }
     joblib_dump(artifact, model_out)
+    hyperparameter_selection = build_hyperparameter_selection(
+        selection_method="manual_holdout_configuration",
+        validation_scheme="train_test_split(stratified holdout)",
+        objective_metric="roc_auc",
+        search_performed=False,
+        selected_config_name="default_training_profile",
+        selected_params={
+            "vectorizer": {
+                "analyzer": "char",
+                "ngram_range": [3, 5],
+                "n_features": int(args.n_features),
+                "lowercase": True,
+                "alternate_sign": False,
+                "norm": "l2",
+            },
+            "classifier": {
+                "loss": "log_loss",
+                "alpha": float(args.alpha),
+                "max_iter": int(args.max_iter),
+                "tol": 1e-3,
+                "class_weight": "balanced",
+                "early_stopping": True,
+                "n_iter_no_change": 5,
+                "random_state": int(args.seed),
+            },
+        },
+        selection_notes=(
+            "The project records the chosen URL model hyperparameters in metadata. "
+            "No automated grid, random, or Bayesian search is currently stored."
+        ),
+    )
 
     metadata = {
         "model_type": artifact["model_type"],
@@ -297,6 +333,7 @@ def main() -> None:
         "confusion_matrix": evaluation["confusion_matrix"],
         "roc_curve_points": evaluation.get("roc_curve_points", []),
         "notes": "Trained on phishing-dataset JSON text/label records; designed for URL string inference.",
+        "hyperparameter_selection": hyperparameter_selection,
         "training_info": {
             "vectorizer": "HashingVectorizer(char, 3-5)",
             "classifier": "SGDClassifier(log_loss, class_weight=balanced)",

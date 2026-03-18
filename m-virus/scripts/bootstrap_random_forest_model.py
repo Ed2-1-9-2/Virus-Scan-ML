@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -25,6 +26,12 @@ from sklearn.metrics import (
     roc_curve,
 )
 from sklearn.model_selection import train_test_split
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from backend.metadata_utils import build_hyperparameter_selection
 
 
 def _load_input_features(metadata_path: Path, fallback: int) -> int:
@@ -128,6 +135,7 @@ def _write_metadata(
     train_samples: int,
     test_samples: int,
     evaluation: Dict,
+    hyperparameter_selection: Dict,
 ) -> None:
     payload = {
         "model_type": "RandomForest Binary Classifier",
@@ -146,6 +154,7 @@ def _write_metadata(
             "Replace with a properly trained artifact for production quality."
         ),
         "bootstrap_generated": True,
+        "hyperparameter_selection": hyperparameter_selection,
     }
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     with metadata_path.open("w", encoding="utf-8") as handle:
@@ -198,6 +207,25 @@ def main() -> int:
     )
     model.fit(x_train, y_train)
     evaluation = _evaluate_model(model=model, x_test=x_test, y_test=y_test, threshold=0.5)
+    hyperparameter_selection = build_hyperparameter_selection(
+        selection_method="synthetic_bootstrap_profile",
+        validation_scheme="synthetic train_test_split",
+        objective_metric="roc_auc",
+        search_performed=False,
+        selected_config_name="portable_bootstrap_profile",
+        selected_params={
+            "n_estimators": 240,
+            "max_depth": 24,
+            "min_samples_leaf": 2,
+            "class_weight": "balanced_subsample",
+            "n_jobs": 1,
+            "random_state": int(args.seed),
+        },
+        selection_notes=(
+            "Bootstrap fallback metadata records a fixed portable Random Forest profile. "
+            "It is intended only to keep the launcher functional until a trained artifact replaces it."
+        ),
+    )
 
     model_out.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, model_out)
@@ -207,6 +235,7 @@ def main() -> int:
         train_samples=len(y_train),
         test_samples=len(y_test),
         evaluation=evaluation,
+        hyperparameter_selection=hyperparameter_selection,
     )
 
     print(f"Fallback RandomForest model saved to: {model_out}")

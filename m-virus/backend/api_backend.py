@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 import io
 import hashlib
 import hmac
+import json
+import mimetypes
 import os
 import re
 import secrets
@@ -34,6 +36,8 @@ from backend.model_core import (
     XGBoostMalwareModel,
     flatten_ember_features,
 )
+from backend.explainability import build_unavailable_explainability
+from backend.metadata_utils import resolve_hyperparameter_selection
 from backend.pe_to_features import (
     extract_raw_from_bytes,
     extract_model_features_from_bytes,
@@ -101,6 +105,16 @@ FRONTEND_BUILD_DIR = Path(
 ).resolve()
 FRONTEND_INDEX_FILE = FRONTEND_BUILD_DIR / "index.html"
 FRONTEND_STATIC_DIR = FRONTEND_BUILD_DIR / "static"
+REPORTS_DIR = Path(os.getenv("REPORTS_DIR", str(PROJECT_ROOT / "reports"))).resolve()
+SHAP_MANIFEST_PATH = Path(
+    os.getenv("SHAP_MANIFEST_PATH", str(REPORTS_DIR / "shap_manifest.json"))
+).resolve()
+CLASSIC_FEATURE_IMPORTANCE_MANIFEST_PATH = Path(
+    os.getenv(
+        "CLASSIC_FEATURE_IMPORTANCE_MANIFEST_PATH",
+        str(REPORTS_DIR / "classic_feature_importance_manifest.json"),
+    )
+).resolve()
 AUTH_DB_PATH = Path(os.getenv("AUTH_DB_PATH", PROJECT_ROOT / "backend" / "auth.db")).resolve()
 AUTH_PASSWORD_ITERATIONS = int(os.getenv("AUTH_PASSWORD_ITERATIONS", "310000"))
 AUTH_MIN_PASSWORD_LENGTH = int(os.getenv("AUTH_MIN_PASSWORD_LENGTH", "8"))
@@ -157,6 +171,126 @@ def _resolve_frontend_asset(asset_path: str) -> Optional[Path]:
     if candidate.is_file():
         return candidate
     return None
+
+
+REPORT_ARTIFACT_ORDER = {
+    "classic_feature_importance": 0,
+    "shap_summary_bar": 1,
+    "shap_beeswarm": 2,
+    "shap_waterfall": 3,
+}
+
+REPORT_ARTIFACT_FAMILY = {
+    "classic_feature_importance": "classic",
+    "shap_summary_bar": "shap",
+    "shap_beeswarm": "shap",
+    "shap_waterfall": "shap",
+}
+
+
+def _load_report_manifest(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _resolve_report_artifact_path(raw_path: Any) -> Optional[Path]:
+    raw_text = str(raw_path or "").strip()
+    if not raw_text:
+        return None
+
+    explicit_candidate = Path(raw_text)
+    if explicit_candidate.is_file():
+        resolved = explicit_candidate.resolve()
+        if resolved == REPORTS_DIR or REPORTS_DIR in resolved.parents:
+            return resolved
+
+    candidate = (REPORTS_DIR / explicit_candidate.name).resolve()
+    if candidate.is_file() and (candidate == REPORTS_DIR or REPORTS_DIR in candidate.parents):
+        return candidate
+    return None
+
+
+def _report_artifact_kind_from_filename(filename: str) -> Optional[str]:
+    lower_name = filename.lower()
+    if lower_name.startswith("classic_feature_importance_"):
+        return "classic_feature_importance"
+    if lower_name.startswith("shap_summary_bar_"):
+        return "shap_summary_bar"
+    if lower_name.startswith("shap_beeswarm_"):
+        return "shap_beeswarm"
+    if lower_name.startswith("shap_waterfall_"):
+        return "shap_waterfall"
+    return None
+
+
+def _collect_model_report_assets(model_name: str) -> Dict[str, Any]:
+    assets: List[Dict[str, Any]] = []
+    shap_manifest = _load_report_manifest(SHAP_MANIFEST_PATH)
+    classic_manifest = _load_report_manifest(CLASSIC_FEATURE_IMPORTANCE_MANIFEST_PATH)
+
+    shap_models = shap_manifest.get("models")
+    if isinstance(shap_models, dict):
+        shap_entry = shap_models.get(model_name)
+        if isinstance(shap_entry, dict):
+            for raw_path in shap_entry.get("output_files", []):
+                resolved = _resolve_report_artifact_path(raw_path)
+                if resolved is None:
+                    continue
+                kind = _report_artifact_kind_from_filename(resolved.name)
+                if kind is None:
+                    continue
+                assets.append(
+                    {
+                        "kind": kind,
+                        "family": REPORT_ARTIFACT_FAMILY.get(kind, "report"),
+                        "path": resolved,
+                    }
+                )
+
+    classic_models = classic_manifest.get("models")
+    if isinstance(classic_models, dict):
+        classic_entry = classic_models.get(model_name)
+        if isinstance(classic_entry, dict):
+            resolved = _resolve_report_artifact_path(classic_entry.get("output_file"))
+            if resolved is not None:
+                kind = _report_artifact_kind_from_filename(resolved.name)
+                if kind is not None:
+                    assets.append(
+                        {
+                            "kind": kind,
+                            "family": REPORT_ARTIFACT_FAMILY.get(kind, "report"),
+                            "path": resolved,
+                        }
+                    )
+
+    seen_kinds = set()
+    normalized_assets: List[Dict[str, Any]] = []
+    for asset in sorted(assets, key=lambda item: REPORT_ARTIFACT_ORDER.get(item["kind"], 99)):
+        kind = asset["kind"]
+        if kind in seen_kinds:
+            continue
+        seen_kinds.add(kind)
+        normalized_assets.append(
+            {
+                "kind": kind,
+                "family": asset["family"],
+                "url": f"/model-report-assets/{model_name}/{kind}",
+                "path": asset["path"],
+            }
+        )
+
+    note = shap_manifest.get("note") if normalized_assets else None
+    return {
+        "available": bool(normalized_assets),
+        "note": str(note).strip() if note else None,
+        "plots": normalized_assets,
+    }
 
 
 allowed_origins, allow_credentials = _parse_allowed_origins()
@@ -256,6 +390,7 @@ class ModelPredictionResponse(BaseModel):
     confidence: float
     threshold: float
     input_features: int
+    explainable_ai: Optional[Dict[str, Any]] = None
 
 
 class PredictionComparisonResponse(PredictionResponse):
@@ -916,7 +1051,10 @@ async def predict_file(
 
         for model_name, model_obj in predict_models.items():
             try:
-                model_pred = model_obj.predict_one(features=base_features, sha256=file_sha)
+                if hasattr(model_obj, "explain_one"):
+                    model_pred = model_obj.explain_one(features=base_features, sha256=file_sha)
+                else:
+                    model_pred = model_obj.predict_one(features=base_features, sha256=file_sha)
                 model_results[model_name] = ModelPredictionResponse(
                     model_name=model_name,
                     model_type=model_obj.metadata.get("model_type", model_obj.__class__.__name__),
@@ -925,6 +1063,7 @@ async def predict_file(
                     confidence=float(model_pred["confidence"]),
                     threshold=float(model_obj.threshold),
                     input_features=int(model_obj.feature_count),
+                    explainable_ai=model_pred.get("explainable_ai"),
                 )
             except Exception as model_exc:
                 unavailable_models[model_name] = f"Prediction failed: {model_exc}"
@@ -1115,6 +1254,35 @@ async def scan_archive(
     )
 
 
+@app.get("/model-report-assets/{model_name}/{artifact_kind}")
+async def model_report_asset(
+    model_name: str,
+    artifact_kind: str,
+    _user: AuthenticatedUser = Depends(require_auth_user),
+):
+    assets = _collect_model_report_assets(model_name).get("plots", [])
+    match = next((item for item in assets if item.get("kind") == artifact_kind), None)
+    if not match:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model report artifact '{artifact_kind}' is not available for '{model_name}'.",
+        )
+
+    report_path = match.get("path")
+    if not isinstance(report_path, Path) or not report_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Report file for '{artifact_kind}' could not be found on disk.",
+        )
+
+    media_type = mimetypes.guess_type(report_path.name)[0] or "application/octet-stream"
+    return FileResponse(
+        str(report_path),
+        media_type=media_type,
+        filename=report_path.name,
+    )
+
+
 @app.get("/model-info")
 async def model_info(_user: AuthenticatedUser = Depends(require_auth_user)):
     model = require_model()
@@ -1125,6 +1293,16 @@ async def model_info(_user: AuthenticatedUser = Depends(require_auth_user)):
     for model_name, model_obj in runtime_predict_models.items():
         model_meta = model_obj.metadata if isinstance(model_obj.metadata, dict) else {}
         corr_matrix, corr_labels = _resolve_correlation_artifacts(model_meta)
+        explainable_ai = (
+            model_obj.get_global_explainability()
+            if hasattr(model_obj, "get_global_explainability")
+            else build_unavailable_explainability(
+                note="This model does not expose explainable AI metadata."
+            )
+        )
+        if not isinstance(explainable_ai, dict):
+            explainable_ai = {}
+        report_assets = _collect_model_report_assets(model_name)
         loaded_models[model_name] = {
             "model_name": model_name,
             "model_type": model_meta.get("model_type", model_obj.__class__.__name__),
@@ -1141,6 +1319,16 @@ async def model_info(_user: AuthenticatedUser = Depends(require_auth_user)):
             "created_at": model_meta.get("created_at"),
             "notes": model_meta.get("notes"),
             "training_info": model_meta.get("training_info"),
+            "hyperparameter_selection": resolve_hyperparameter_selection(model_meta),
+            "explainable_ai": {
+                **explainable_ai,
+                "report_note": report_assets.get("note"),
+                "report_plots": [
+                    {key: value for key, value in plot.items() if key != "path"}
+                    for plot in report_assets.get("plots", [])
+                    if isinstance(plot, dict)
+                ],
+            },
             "bootstrap_generated": bool(model_meta.get("bootstrap_generated")),
         }
 
@@ -1172,6 +1360,14 @@ async def model_info(_user: AuthenticatedUser = Depends(require_auth_user)):
             "test_samples": url_meta.get("test_samples"),
             "notes": url_meta.get("notes"),
             "training_info": url_meta.get("training_info"),
+            "hyperparameter_selection": resolve_hyperparameter_selection(url_meta),
+            "explainable_ai": (
+                runtime_url_model.get_global_explainability()
+                if hasattr(runtime_url_model, "get_global_explainability")
+                else build_unavailable_explainability(
+                    note="This URL model does not expose explainable AI metadata."
+                )
+            ),
             "created_at": url_meta.get("created_at", runtime_url_model.created_at),
         }
     else:

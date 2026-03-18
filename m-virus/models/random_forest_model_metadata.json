@@ -24,6 +24,22 @@
     ]
   ],
   "notes": "Trained using separate feature blocks. EMBER=626 EMBER2024=2568 BODMAS=2381 domain_flags=['bodmas', 'ember2024'] Inference from legacy EMBER/PE inputs fills EMBER block while other blocks remain zero.",
+  "hyperparameter_selection": {
+    "selection_method": "manual_holdout_configuration",
+    "validation_scheme": "holdout test split",
+    "objective_metric": "roc_auc",
+    "search_performed": false,
+    "selected_config_name": "default_training_profile",
+    "selection_notes": "The project records the chosen Random Forest hyperparameters in metadata. No automated grid, random, or Bayesian search is currently stored.",
+    "selected_params": {
+      "n_estimators": 500,
+      "max_depth": null,
+      "min_samples_leaf": 1,
+      "class_weight": "balanced_subsample",
+      "n_jobs": -1,
+      "random_state": 42
+    }
+  },
   "training_info": {
     "feature_space_mode": "separate_blocks_multi_domain",
     "ember_features": 626,
